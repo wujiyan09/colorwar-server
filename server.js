@@ -1,53 +1,74 @@
-const WebSocket = require('ws');
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+// 存储当前活跃的房间和连接 { roomCode: Set<WebSocket> }
+const rooms = new Map();
 
-// 房间状态映射：{ roomCode: [ws1, ws2, ...] }
-const rooms = {};
+export default {
+  async fetch(request, env, ctx) {
+    const upgradeHeader = request.headers.get('Upgrade');
+    
+    // 检查是否为 WebSocket 升级请求
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+      return new Response('ColorWar WebSocket Server is Running!', { status: 200 });
+    }
 
-console.log(`[ColorWar] WebSocket 服务器初始化，监听端口: ${PORT}`);
+    // 创建 WebSocketPair 对
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
 
-wss.on('connection', (ws) => {
     let currentRoom = null;
 
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
+    // 接受连接
+    server.accept();
 
-            // 1. 处理玩家加入/创建房间请求
-            if (data.action === 'joinRoom') {
-                currentRoom = data.roomCode;
-                if (!rooms[currentRoom]) {
-                    rooms[currentRoom] = [];
-                }
-                if (!rooms[currentRoom].includes(ws)) {
-                    rooms[currentRoom].push(ws);
-                }
-                console.log(`[ColorWar] 玩家加入房间: ${currentRoom}，当前房间人数: ${rooms[currentRoom].length}`);
-                return;
-            }
+    // 监听客户端消息
+    server.addEventListener('message', event => {
+      try {
+        const data = JSON.parse(event.data);
 
-            // 2. 将收到的 P2PPacket 数据原样广播给该房间内的其他所有在线玩家
-            if (currentRoom && rooms[currentRoom]) {
-                rooms[currentRoom].forEach((client) => {
-                    if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(message.toString());
-                    }
-                });
-            }
-        } catch (e) {
-            console.error('[ColorWar] 消息解析错误:', e);
+        // 加入/创建房间
+        if (data.action === 'joinRoom') {
+          currentRoom = data.roomCode;
+          if (!rooms.has(currentRoom)) {
+            rooms.set(currentRoom, new Set());
+          }
+          rooms.get(currentRoom).add(server);
+          return;
         }
+
+        // 转发数据包给同房间其他玩家
+        if (currentRoom && rooms.has(currentRoom)) {
+          const clients = rooms.get(currentRoom);
+          for (const targetSocket of clients) {
+            if (targetSocket !== server) {
+              try {
+                targetSocket.send(event.data);
+              } catch (e) {
+                clients.delete(targetSocket);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error("解析消息失败:", e);
+      }
     });
 
-    ws.on('close', () => {
-        if (currentRoom && rooms[currentRoom]) {
-            rooms[currentRoom] = rooms[currentRoom].filter(client => client !== ws);
-            console.log(`[ColorWar] 玩家离开房间: ${currentRoom}，剩余人数: ${rooms[currentRoom].length}`);
-            if (rooms[currentRoom].length === 0) {
-                delete rooms[currentRoom];
-                console.log(`[ColorWar] 房间 ${currentRoom} 已销毁`);
-            }
+    // 连接断开清理
+    const cleanup = () => {
+      if (currentRoom && rooms.has(currentRoom)) {
+        const clients = rooms.get(currentRoom);
+        clients.delete(server);
+        if (clients.size === 0) {
+          rooms.delete(currentRoom);
         }
+      }
+    };
+
+    server.addEventListener('close', cleanup);
+    server.addEventListener('error', cleanup);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
     });
-});
+  }
+};
