@@ -1,0 +1,12 @@
+{
+  "name": "colorwar-websocket-server",
+  "version": "1.0.0",
+  "description": "Color War WebSocket Relay Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
