@@ -67,6 +67,10 @@ export class Room {
     server.accept();
     this.sockets.set(server, { playerIndex, isHost: role === "host", nickname });
     this.room.players.set(playerIndex, nickname);
+    if (role !== "host" && this.room.config) {
+      this.refreshRoomConfigFromParticipants();
+      this.broadcastRoomConfig();
+    }
 
     server.addEventListener("message", (event) => this.onMessage(server, event.data));
     server.addEventListener("close", () => this.onClose(server));
@@ -125,6 +129,27 @@ export class Room {
 
   broadcastRoster() { this.broadcast(this.rosterPacket()); }
 
+  refreshRoomConfigFromParticipants() {
+    if (!this.room?.config) return;
+    const playerNames = this.playerNames();
+    const playerTypes = this.playerTypes();
+    this.room.config = { ...this.room.config, playerNames, playerTypes };
+    for (const cached of [this.room.startPacket, this.room.snapshot]) {
+      if (cached) Object.assign(cached, { playerNames, playerTypes });
+    }
+  }
+
+  broadcastRoomConfig() {
+    if (!this.room?.config) return;
+    this.broadcast({
+      ...this.room.config,
+      protocolVersion: PROTOCOL_VERSION,
+      action: "hostConfig",
+      senderID: "server",
+      sequenceID: this.nextSequence(),
+    });
+  }
+
   // Replays need fresh room-wide sequence numbers; otherwise clients discard them as stale.
   sendRoomState(socket) {
     if (!this.room) return;
@@ -179,12 +204,10 @@ export class Room {
       if (!participant.isHost) return;
       const normalized = { ...message, sequenceID: this.nextSequence() };
       const requestedNames = Array.isArray(message.playerNames) ? message.playerNames : [];
-      const requestedTypes = Array.isArray(message.playerTypes) ? message.playerTypes : [];
-      const allowedTypes = new Set(Object.values(PLAYER_TYPES));
       normalized.playerNames = Array.from({ length: MAX_PLAYERS }, (_, i) =>
         typeof requestedNames[i] === "string" ? requestedNames[i].trim().slice(0, 32) : this.playerNames()[i]);
-      normalized.playerTypes = Array.from({ length: MAX_PLAYERS }, (_, i) =>
-        allowedTypes.has(requestedTypes[i]) ? requestedTypes[i] : this.playerTypes()[i]);
+      // Roles are fixed when the room is established. A connected client cannot mutate them via hostConfig.
+      normalized.playerTypes = this.playerTypes();
       const requestedBoardSize = Number(message.boardSize);
       normalized.boardSize = Number.isInteger(requestedBoardSize) && requestedBoardSize >= 5 && requestedBoardSize <= 12
         ? requestedBoardSize
@@ -201,7 +224,8 @@ export class Room {
         }
       }
       this.room.config = normalized;
-      this.broadcast(normalized, socket);
+      // Echo the canonical role assignment to the host too, correcting stale or tampered local state.
+      this.broadcast(normalized);
       return;
     }
 
@@ -305,10 +329,22 @@ export class Room {
       return;
     }
 
+    if (this.room.config) {
+      const playerTypes = this.playerTypes();
+      const playerNames = this.playerNames();
+      playerTypes[participant.playerIndex] = this.room.started ? PLAYER_TYPES.mathNightmare : PLAYER_TYPES.disabled;
+      playerNames[participant.playerIndex] = this.room.started ? `AI 玩家${participant.playerIndex + 1}` : "";
+      this.room.config = { ...this.room.config, playerTypes, playerNames };
+      for (const cached of [this.room.startPacket, this.room.snapshot]) {
+        if (cached) Object.assign(cached, { playerNames, playerTypes });
+      }
+    }
+
     this.broadcast(packet("playerLeft", this.nextSequence(), {
       playerIndex: participant.playerIndex,
       message: `${participant.nickname} 已离开房间`,
     }));
+    this.broadcastRoomConfig();
     this.broadcastRoster();
   }
 }

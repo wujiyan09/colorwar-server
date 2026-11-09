@@ -131,19 +131,20 @@ test("startGame carries the host's canonical board size to guests", () => {
 });
 
 
-test("host may switch its role to AI while connected player seats stay network-controlled", () => {
+test("online hostConfig cannot change any role and server echoes canonical assignments", () => {
   const { room, host, guest } = setupRoom();
-  room.room.config = { playerNames: ["Host", "Guest"], playerTypes: ["真人", "网络玩家"] };
+  room.room.config = {
+    playerNames: ["Host", "Guest", "AI", "Empty"],
+    playerTypes: ["真人", "网络玩家", "算法-噩梦", "未加入"],
+  };
   room.onMessage(host, JSON.stringify({
     protocolVersion: 2, action: "hostConfig", sequenceID: 30,
-    playerNames: ["Host", "Guest", "AI"],
-    playerTypes: ["算法-噩梦", "算法-噩梦", "算法-噩梦"],
+    playerNames: ["Host", "Guest", "AI", "Empty"],
+    playerTypes: ["算法-噩梦", "真人", "真人", "增强噩梦"],
   }));
-  assert.equal(room.room.config.playerTypes[0], "算法-噩梦");
-  assert.equal(room.room.config.playerTypes[1], "网络玩家");
-  assert.equal(room.playerTypes()[0], "算法-噩梦");
-  assert.equal(guest.messages.at(-1).playerTypes[0], "算法-噩梦");
-  assert.equal(guest.messages.at(-1).playerTypes[1], "网络玩家");
+  assert.deepEqual(room.room.config.playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦", "未加入"]);
+  assert.deepEqual(guest.messages.at(-1).playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦", "未加入"]);
+  assert.deepEqual(host.messages.at(-1).playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦", "未加入"]);
 });
 
 
@@ -182,6 +183,34 @@ test("disconnecting the host explicitly notifies remaining room members", () => 
   room.onClose(host);
   assert.equal(guest.messages.at(-1).action, "roomClosed");
   assert.equal(guest.messages.at(-1).message, "房主已断开连接，对局已结束。");
+});
+
+test("a departed guest is server-assigned AI in-game, without opening role edits", () => {
+  const { room, host, guest, observer } = setupRoom();
+  room.room.config.playerNames = ["Host", "Guest", "Observer"];
+  room.room.startPacket = { action: "startGame", playerNames: ["Host", "Guest", "Observer"], playerTypes: [...room.room.config.playerTypes] };
+  room.room.snapshot = { action: "stateSnapshot", playerNames: ["Host", "Guest", "Observer"], playerTypes: [...room.room.config.playerTypes] };
+  room.onClose(guest);
+  assert.equal(room.room.config.playerTypes[1], "算法-噩梦");
+  assert.equal(room.room.config.playerNames[1], "AI 玩家2");
+  assert.equal(room.room.startPacket.playerTypes[1], "算法-噩梦");
+  assert.equal(room.room.snapshot.playerTypes[1], "算法-噩梦");
+  const hostConfig = host.messages.findLast((item) => item.action === "hostConfig");
+  assert.equal(hostConfig.playerTypes[1], "算法-噩梦");
+  assert.equal(hostConfig.senderID, "server");
+  assert.ok(hostConfig.sequenceID > host.messages.findLast((item) => item.action === "playerLeft").sequenceID);
+  assert.equal(observer.messages.findLast((item) => item.action === "hostConfig").playerTypes[1], "算法-噩梦");
+});
+
+
+test("a guest leaving the lobby frees the seat without client role selection", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.started = false;
+  room.room.config.playerNames = ["Host", "Guest"];
+  room.onClose(guest);
+  assert.equal(room.room.config.playerTypes[1], "未加入");
+  assert.equal(room.room.config.playerNames[1], "");
+  assert.equal(host.messages.findLast((item) => item.action === "hostConfig").playerTypes[1], "未加入");
 });
 
 test("host configuration normalizes board size and fixed-size roster arrays", () => {
@@ -252,6 +281,7 @@ test("host config ignores unknown player types and caps supplied nicknames", () 
   assert.equal(room.room.config.playerNames[2], "AI seat");
   assert.equal(room.room.config.playerTypes[0], "真人");
   assert.equal(room.room.config.playerTypes[1], "网络玩家");
+  // Online role assignments are frozen from the existing room state, not hostConfig input.
   assert.equal(room.room.config.playerTypes[2], "算法-噩梦");
   assert.equal(guest.messages.at(-1).playerTypes[2], "算法-噩梦");
 });
