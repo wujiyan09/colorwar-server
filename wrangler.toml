@@ -1,3 +1,14 @@
 name = "colorwar-server"
-main = "server.js" # 💡 替换为您实际的代码文件名
-compatibility_date = "2024-01-01"
+main = "server.js"
+compatibility_date = "2026-11-09"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+
+[observability]
+enabled = true

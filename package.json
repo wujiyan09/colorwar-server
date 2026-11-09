@@ -1,12 +1,15 @@
 {
   "name": "colorwar-websocket-server",
-  "version": "1.0.0",
-  "description": "Color War WebSocket Relay Server",
-  "main": "server.js",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared WebSocket room relay for Color War web and iOS clients.",
   "scripts": {
-    "start": "node server.js"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node --test"
   },
-  "dependencies": {
-    "ws": "^8.16.0"
+  "devDependencies": {
+    "wrangler": "^4.0.0"
   }
 }
