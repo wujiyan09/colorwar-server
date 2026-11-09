@@ -131,6 +131,52 @@ test("startGame carries the host's canonical board size to guests", () => {
 });
 
 
+test("host may switch its role to AI while connected player seats stay network-controlled", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.config = { playerNames: ["Host", "Guest"], playerTypes: ["真人", "网络玩家"] };
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "hostConfig", sequenceID: 30,
+    playerNames: ["Host", "Guest", "AI"],
+    playerTypes: ["算法-噩梦", "算法-噩梦", "算法-噩梦"],
+  }));
+  assert.equal(room.room.config.playerTypes[0], "算法-噩梦");
+  assert.equal(room.room.config.playerTypes[1], "网络玩家");
+  assert.equal(room.playerTypes()[0], "算法-噩梦");
+  assert.equal(guest.messages.at(-1).playerTypes[0], "算法-噩梦");
+  assert.equal(guest.messages.at(-1).playerTypes[1], "网络玩家");
+});
+
+
+test("guest move reaches host and observers; final authoritative chain snapshot reaches guests", () => {
+  const { room, host, guest, observer } = setupRoom();
+  room.onMessage(guest, move(1, 3, 3));
+  assert.equal(host.messages.at(-1).action, "playerMove");
+  assert.equal(observer.messages.at(-1).action, "playerMove");
+  // The mover is intentionally not echoed by the server; it animates its own accepted move locally.
+  assert.equal(guest.messages.length, 0);
+
+  const finalCascadeBoard = [
+    { r: 3, c: 3, owner: 1, count: 1 },
+    { r: 3, c: 2, owner: 1, count: 2 },
+    { r: 3, c: 4, owner: 1, count: 1 },
+  ];
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "stateSnapshot", sequenceID: 2, boardSize: 8,
+    compactBoardSnapshot: finalCascadeBoard, currentTurnIndex: 2,
+    hasEnteredSnapshot: [true, true, false], eliminatedSnapshot: Array(8).fill(false),
+  }));
+  for (const socket of [guest, observer]) {
+    const snapshot = socket.messages.at(-1);
+    assert.equal(snapshot.action, "stateSnapshot");
+    assert.deepEqual(snapshot.compactBoardSnapshot, finalCascadeBoard);
+    assert.equal(snapshot.currentTurnIndex, 2);
+  }
+  assert.deepEqual(room.room.snapshot.compactBoardSnapshot, finalCascadeBoard);
+  assert.equal(room.room.currentTurnIndex, 2);
+  assert.equal(room.room.movePending, false);
+});
+
+
 test("disconnecting the host explicitly notifies remaining room members", () => {
   const { room, host, guest } = setupRoom();
   room.onClose(host);

@@ -101,7 +101,16 @@ export class Room {
       for (let i = 0; i < MAX_PLAYERS; i++) types[i] = this.room.config.playerTypes[i] ?? types[i];
     }
     if (this.room) {
-      for (const [index] of this.room.players) types[index] = index === 0 ? PLAYER_TYPES.human : PLAYER_TYPES.network;
+      for (const [index] of this.room.players) {
+        if (index === 0) {
+          const hostType = this.room.config?.playerTypes?.[0];
+          types[index] = hostType === PLAYER_TYPES.mathNightmare || hostType === PLAYER_TYPES.enhancedNightmare
+            ? hostType
+            : PLAYER_TYPES.human;
+        } else {
+          types[index] = PLAYER_TYPES.network;
+        }
+      }
     }
     return types;
   }
@@ -182,7 +191,14 @@ export class Room {
         : (Number.isInteger(this.room.config?.boardSize) ? this.room.config.boardSize : 8);
       for (const [index, name] of this.room.players) {
         normalized.playerNames[index] = name;
-        normalized.playerTypes[index] = index === 0 ? PLAYER_TYPES.human : PLAYER_TYPES.network;
+        if (index === 0) {
+          const hostType = normalized.playerTypes[index];
+          normalized.playerTypes[index] = hostType === PLAYER_TYPES.mathNightmare || hostType === PLAYER_TYPES.enhancedNightmare
+            ? hostType
+            : PLAYER_TYPES.human;
+        } else {
+          normalized.playerTypes[index] = PLAYER_TYPES.network;
+        }
       }
       this.room.config = normalized;
       this.broadcast(normalized, socket);
