@@ -105,13 +105,107 @@ test("starting a new match invalidates the previous cached snapshot", () => {
 
 test("renamePlayer updates only the connected participant's assigned roster seat", () => {
   const { room, host, guest, observer } = setupRoom();
+  room.room.config.playerNames = ["Host", "Guest", "", ""];
   room.onMessage(guest, JSON.stringify({
     protocolVersion: 2, action: "renamePlayer", sequenceID: 3, playerIndex: 0, nickname: "  New Guest  ",
   }));
   assert.equal(room.room.players.get(1), "New Guest");
   assert.equal(room.room.players.get(0), "Host");
+  assert.equal(room.room.config.playerNames[1], "New Guest");
   for (const socket of [host, guest, observer]) {
     assert.equal(socket.messages.at(-1).action, "roomRoster");
     assert.equal(socket.messages.at(-1).playerNames[1], "New Guest");
   }
+});
+
+
+test("startGame carries the host's canonical board size to guests", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.config = { protocolVersion: 2, action: "hostConfig", boardSize: 10, playerTypes: ["真人", "网络玩家"] };
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "startGame", sequenceID: 10, firstPlayerIndex: 0, boardSize: 8,
+  }));
+  assert.equal(room.room.startPacket.action, "startGame");
+  assert.equal(room.room.startPacket.boardSize, 10);
+  assert.equal(guest.messages.at(-1).boardSize, 10);
+});
+
+
+test("disconnecting the host explicitly notifies remaining room members", () => {
+  const { room, host, guest } = setupRoom();
+  room.onClose(host);
+  assert.equal(guest.messages.at(-1).action, "roomClosed");
+  assert.equal(guest.messages.at(-1).message, "房主已断开连接，对局已结束。");
+});
+
+test("host configuration normalizes board size and fixed-size roster arrays", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.config = { boardSize: 10 };
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "hostConfig", sequenceID: 12, boardSize: 99,
+    playerNames: ["Host"], playerTypes: ["真人"],
+  }));
+  assert.equal(room.room.config.boardSize, 10);
+  assert.equal(room.room.config.playerNames.length, 8);
+  assert.equal(room.room.config.playerTypes.length, 8);
+  assert.equal(guest.messages.at(-1).boardSize, 10);
+});
+
+test("rejects moves outside the configured board", () => {
+  const { room, guest, host } = setupRoom();
+  room.room.config.boardSize = 6;
+  room.onMessage(guest, move(1, 6, 0));
+  assert.equal(room.room.movePending, false);
+  assert.equal(host.messages.length, 0);
+});
+
+test("rejects starts and snapshots targeting disabled seats", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.started = false;
+  room.room.config.playerTypes[7] = "未加入";
+  room.onMessage(host, JSON.stringify({ protocolVersion: 2, action: "startGame", firstPlayerIndex: 7 }));
+  assert.equal(room.room.started, false);
+  assert.equal(room.room.startPacket, null);
+  room.room.started = true;
+  room.room.movePending = true;
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "stateSnapshot", currentTurnIndex: 7, compactBoardSnapshot: [],
+  }));
+  assert.equal(room.room.movePending, true);
+  assert.equal(guest.messages.length, 0);
+});
+
+test("authoritative snapshots are bounded to the configured board and carry canonical size", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.config.boardSize = 6;
+  room.room.config.playerNames = ["Host", "Guest"];
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "stateSnapshot", currentTurnIndex: 1, boardSize: 12,
+    compactBoardSnapshot: [
+      { r: 1, c: 2, owner: 1, count: 3 },
+      { r: 7, c: 1, owner: 1, count: 1 },
+      { r: 0, c: 0, owner: 9, count: 2 },
+    ],
+  }));
+  assert.equal(room.room.snapshot.boardSize, 6);
+  assert.deepEqual(room.room.snapshot.compactBoardSnapshot, [{ r: 1, c: 2, owner: 1, count: 3 }]);
+  assert.equal(guest.messages.at(-1).playerNames[1], "Guest");
+  assert.equal(room.room.movePending, false);
+});
+
+
+test("host config ignores unknown player types and caps supplied nicknames", () => {
+  const { room, host, guest } = setupRoom();
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "hostConfig", sequenceID: 20, boardSize: 8,
+    playerNames: ["a".repeat(50), "Guest attempt", "AI seat"],
+    playerTypes: ["unknown", "unknown", "unknown"],
+  }));
+  assert.equal(room.room.config.playerNames[0], "Host");
+  assert.equal(room.room.config.playerNames[1], "Guest");
+  assert.equal(room.room.config.playerNames[2], "AI seat");
+  assert.equal(room.room.config.playerTypes[0], "真人");
+  assert.equal(room.room.config.playerTypes[1], "网络玩家");
+  assert.equal(room.room.config.playerTypes[2], "算法-噩梦");
+  assert.equal(guest.messages.at(-1).playerTypes[2], "算法-噩梦");
 });

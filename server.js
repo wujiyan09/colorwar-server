@@ -157,6 +157,11 @@ export class Room {
       if (!nickname) return;
       participant.nickname = nickname;
       this.room.players.set(participant.playerIndex, nickname);
+      if (this.room.config && Array.isArray(this.room.config.playerNames)) {
+        const names = this.room.config.playerNames.slice(0, MAX_PLAYERS);
+        names[participant.playerIndex] = nickname;
+        this.room.config.playerNames = names;
+      }
       this.broadcastRoster();
       return;
     }
@@ -164,8 +169,17 @@ export class Room {
     if (action === "hostConfig") {
       if (!participant.isHost) return;
       const normalized = { ...message, sequenceID: this.nextSequence() };
-      normalized.playerNames = Array.isArray(message.playerNames) ? message.playerNames.slice(0, MAX_PLAYERS) : this.playerNames();
-      normalized.playerTypes = Array.isArray(message.playerTypes) ? message.playerTypes.slice(0, MAX_PLAYERS) : this.playerTypes();
+      const requestedNames = Array.isArray(message.playerNames) ? message.playerNames : [];
+      const requestedTypes = Array.isArray(message.playerTypes) ? message.playerTypes : [];
+      const allowedTypes = new Set(Object.values(PLAYER_TYPES));
+      normalized.playerNames = Array.from({ length: MAX_PLAYERS }, (_, i) =>
+        typeof requestedNames[i] === "string" ? requestedNames[i].trim().slice(0, 32) : this.playerNames()[i]);
+      normalized.playerTypes = Array.from({ length: MAX_PLAYERS }, (_, i) =>
+        allowedTypes.has(requestedTypes[i]) ? requestedTypes[i] : this.playerTypes()[i]);
+      const requestedBoardSize = Number(message.boardSize);
+      normalized.boardSize = Number.isInteger(requestedBoardSize) && requestedBoardSize >= 5 && requestedBoardSize <= 12
+        ? requestedBoardSize
+        : (Number.isInteger(this.room.config?.boardSize) ? this.room.config.boardSize : 8);
       for (const [index, name] of this.room.players) {
         normalized.playerNames[index] = name;
         normalized.playerTypes[index] = index === 0 ? PLAYER_TYPES.human : PLAYER_TYPES.network;
@@ -176,22 +190,62 @@ export class Room {
     }
 
     if (action === "startGame") {
-      if (!participant.isHost) return;
+      if (!participant.isHost || !this.room.config) return;
       const firstPlayerIndex = Number(message.firstPlayerIndex);
       if (!Number.isInteger(firstPlayerIndex) || firstPlayerIndex < 0 || firstPlayerIndex >= MAX_PLAYERS) return;
+      const firstPlayerType = this.room.config.playerTypes?.[firstPlayerIndex];
+      if (firstPlayerType === undefined || firstPlayerType === PLAYER_TYPES.disabled) return;
       this.room.started = true;
       this.room.movePending = false;
       this.room.snapshot = null;
       this.room.currentTurnIndex = firstPlayerIndex;
-      this.room.startPacket = { ...message, firstPlayerIndex, sequenceID: this.nextSequence() };
+      const configuredBoardSize = this.room.config?.boardSize;
+      this.room.startPacket = {
+        ...message,
+        ...this.room.config,
+        action: "startGame",
+        playerNames: this.room.config.playerNames,
+        playerTypes: this.room.config.playerTypes,
+        ...(Number.isInteger(configuredBoardSize) ? { boardSize: configuredBoardSize } : {}),
+        firstPlayerIndex,
+        sequenceID: this.nextSequence(),
+      };
       this.broadcast(this.room.startPacket, socket);
       return;
     }
 
     if (action === "stateSnapshot") {
-      if (!participant.isHost) return;
-      this.room.snapshot = { ...message, sequenceID: this.nextSequence() };
-      if (Number.isInteger(message.currentTurnIndex)) this.room.currentTurnIndex = message.currentTurnIndex;
+      if (!participant.isHost || !this.room.started || !Array.isArray(message.compactBoardSnapshot)) return;
+      const currentTurnIndex = Number(message.currentTurnIndex);
+      if (!Number.isInteger(currentTurnIndex) || currentTurnIndex < 0 || currentTurnIndex >= MAX_PLAYERS) return;
+      const turnType = this.room.config?.playerTypes?.[currentTurnIndex];
+      if (turnType === undefined || turnType === PLAYER_TYPES.disabled) return;
+      const boardSize = this.room.config?.boardSize ?? 8;
+      const seenCells = new Set();
+      const compactBoardSnapshot = message.compactBoardSnapshot
+        .filter((cell) => {
+          if (!cell || !Number.isInteger(cell.r) || !Number.isInteger(cell.c)
+            || cell.r < 0 || cell.r >= boardSize || cell.c < 0 || cell.c >= boardSize
+            || !Number.isInteger(cell.owner) || cell.owner < 0 || cell.owner >= MAX_PLAYERS
+            || !Number.isInteger(cell.count) || cell.count <= 0) return false;
+          const key = `${cell.r}:${cell.c}`;
+          if (seenCells.has(key)) return false;
+          seenCells.add(key);
+          return true;
+        })
+        .slice(0, boardSize * boardSize);
+      this.room.snapshot = {
+        ...(this.room.config || {}),
+        ...message,
+        action: "stateSnapshot",
+        boardSize,
+        playerNames: this.room.config?.playerNames ?? message.playerNames,
+        playerTypes: this.room.config?.playerTypes ?? message.playerTypes,
+        compactBoardSnapshot,
+        currentTurnIndex,
+        sequenceID: this.nextSequence(),
+      };
+      this.room.currentTurnIndex = currentTurnIndex;
       this.room.movePending = false;
       this.broadcast(this.room.snapshot, socket);
       return;
@@ -211,7 +265,9 @@ export class Room {
       const playerType = this.room.config?.playerTypes?.[playerIndex];
       const isAI = playerType === PLAYER_TYPES.mathNightmare || playerType === PLAYER_TYPES.enhancedNightmare;
       if (!isOwnSeat && !(participant.isHost && isAI)) return;
-      if (!Number.isInteger(message.row) || !Number.isInteger(message.col) || message.row < 0 || message.row >= 12 || message.col < 0 || message.col >= 12) return;
+      const boardSize = this.room.config?.boardSize ?? 8;
+      if (!Number.isInteger(message.row) || !Number.isInteger(message.col)
+        || message.row < 0 || message.row >= boardSize || message.col < 0 || message.col >= boardSize) return;
       this.room.movePending = true;
       this.broadcast({ ...message, playerIndex, sequenceID: this.nextSequence() }, socket);
       return;
@@ -226,7 +282,7 @@ export class Room {
     this.room.players.delete(participant.playerIndex);
 
     if (participant.isHost) {
-      this.broadcast(packet("roomClosed", this.nextSequence(), { message: "房主已离开房间" }));
+      this.broadcast(packet("roomClosed", this.nextSequence(), { message: "房主已断开连接，对局已结束。" }));
       for (const peer of this.sockets.keys()) { try { peer.close(1000, "host left"); } catch {} }
       this.sockets.clear();
       this.room = null;
