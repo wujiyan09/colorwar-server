@@ -131,7 +131,7 @@ test("startGame carries the host's canonical board size to guests", () => {
 });
 
 
-test("online hostConfig cannot change any role and server echoes canonical assignments", () => {
+test("live hostConfig cannot change assigned roles and server echoes canonical assignments", () => {
   const { room, host, guest } = setupRoom();
   room.room.config = {
     playerNames: ["Host", "Guest", "AI", "Empty"],
@@ -140,11 +140,39 @@ test("online hostConfig cannot change any role and server echoes canonical assig
   room.onMessage(host, JSON.stringify({
     protocolVersion: 2, action: "hostConfig", sequenceID: 30,
     playerNames: ["Host", "Guest", "AI", "Empty"],
-    playerTypes: ["算法-噩梦", "真人", "真人", "增强噩梦"],
+    playerTypes: ["算法-噩梦", "真人", "真人", "算法-噩梦 (加强版)"],
   }));
   assert.deepEqual(room.room.config.playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦", "未加入"]);
   assert.deepEqual(guest.messages.at(-1).playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦", "未加入"]);
   assert.deepEqual(host.messages.at(-1).playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦", "未加入"]);
+});
+
+
+test("lobby host may add AI only to vacant seats; connected seats and invalid roles stay server-owned", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.started = false;
+  room.room.config = {
+    playerNames: ["Host", "Guest", "", ""],
+    playerTypes: ["真人", "网络玩家", "未加入", "未加入"],
+  };
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "hostConfig", sequenceID: 31,
+    playerNames: ["Host", "Changed host", "AI 3", "Bad 4"],
+    playerTypes: ["算法-噩梦", "算法-噩梦", "算法-噩梦 (加强版)", "enhancedNightmare"],
+  }));
+  assert.deepEqual(room.room.config.playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦 (加强版)", "未加入"]);
+  assert.deepEqual(room.room.config.playerNames.slice(0, 4), ["Host", "Guest", "AI 3", "Bad 4"]);
+  assert.deepEqual(host.messages.at(-1).playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦 (加强版)", "未加入"]);
+  assert.deepEqual(guest.messages.at(-1).playerTypes.slice(0, 4), ["真人", "网络玩家", "算法-噩梦 (加强版)", "未加入"]);
+});
+
+
+test("joining guests skip seats reserved for an AI in the lobby", () => {
+  const room = new Room({});
+  room.room = { started: false, config: { playerTypes: ["真人", "算法-噩梦", "未加入"] } };
+  const host = new FakeSocket();
+  room.sockets.set(host, { playerIndex: 0, isHost: true, nickname: "Host" });
+  assert.equal(room.availablePlayerIndex("player"), 2);
 });
 
 

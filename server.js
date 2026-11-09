@@ -103,7 +103,11 @@ export class Room {
     if (this.room.started) {
       return [...this.rejoinableSeats].sort((a, b) => a - b).find((index) => !usedSeats.has(index));
     }
-    return Array.from({ length: MAX_PLAYERS - 1 }, (_, i) => i + 1).find((index) => !usedSeats.has(index));
+    return Array.from({ length: MAX_PLAYERS - 1 }, (_, i) => i + 1).find((index) => {
+      if (usedSeats.has(index)) return false;
+      const configuredType = this.room.config?.playerTypes?.[index];
+      return configuredType !== PLAYER_TYPES.mathNightmare && configuredType !== PLAYER_TYPES.enhancedNightmare;
+    });
   }
 
   playerNames() {
@@ -220,8 +224,21 @@ export class Room {
       const requestedNames = Array.isArray(message.playerNames) ? message.playerNames : [];
       normalized.playerNames = Array.from({ length: MAX_PLAYERS }, (_, i) =>
         typeof requestedNames[i] === "string" ? requestedNames[i].trim().slice(0, 32) : this.playerNames()[i]);
-      // Roles are fixed when the room is established. A connected client cannot mutate them via hostConfig.
+      // Only the host may add/remove AI in vacant lobby seats. Human/network seats are
+      // assigned by the server and all roles freeze once the match starts.
       normalized.playerTypes = this.playerTypes();
+      const requestedTypes = Array.isArray(message.playerTypes) ? message.playerTypes : [];
+      if (!this.room.started) {
+        for (let i = 0; i < MAX_PLAYERS; i++) {
+          if (this.room.players.has(i)) continue;
+          const requestedType = requestedTypes[i];
+          if (requestedType === PLAYER_TYPES.mathNightmare
+            || requestedType === PLAYER_TYPES.enhancedNightmare
+            || requestedType === PLAYER_TYPES.disabled) {
+            normalized.playerTypes[i] = requestedType;
+          }
+        }
+      }
       const requestedBoardSize = Number(message.boardSize);
       // Board geometry is part of the active match state; changing it mid-game would
       // make clients interpret the same snapshot with different dimensions.
@@ -232,14 +249,7 @@ export class Room {
           : (Number.isInteger(this.room.config?.boardSize) ? this.room.config.boardSize : 8));
       for (const [index, name] of this.room.players) {
         normalized.playerNames[index] = name;
-        if (index === 0) {
-          const hostType = normalized.playerTypes[index];
-          normalized.playerTypes[index] = hostType === PLAYER_TYPES.mathNightmare || hostType === PLAYER_TYPES.enhancedNightmare
-            ? hostType
-            : PLAYER_TYPES.human;
-        } else {
-          normalized.playerTypes[index] = PLAYER_TYPES.network;
-        }
+        normalized.playerTypes[index] = index === 0 ? PLAYER_TYPES.human : PLAYER_TYPES.network;
       }
       this.room.config = normalized;
       // Echo the canonical role assignment to the host too, correcting stale or tampered local state.
