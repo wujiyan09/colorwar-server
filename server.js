@@ -41,6 +41,8 @@ export class Room {
     this.sockets = new Map();
     this.sequence = 0;
     this.room = null;
+    // During a live match, only seats vacated by a disconnected participant may be reclaimed.
+    this.rejoinableSeats = new Set();
   }
 
   async fetch(request) {
@@ -54,19 +56,20 @@ export class Room {
     if (role === "host") {
       if (this.room || this.sockets.size) return new Response("Room code is already in use", { status: 409 });
       this.room = { roomCode, started: false, firstPlayerIndex: 0, currentTurnIndex: null, movePending: false, config: null, snapshot: null, startPacket: null, players: new Map() };
+      this.rejoinableSeats.clear();
     } else if (!this.room) {
       return new Response("Room not found", { status: 404 });
     }
 
-    const usedSeats = new Set([...this.sockets.values()].map((entry) => entry.playerIndex));
-    const playerIndex = role === "host" ? 0 : Array.from({ length: MAX_PLAYERS - 1 }, (_, i) => i + 1).find((i) => !usedSeats.has(i));
-    if (playerIndex === undefined) return new Response("Room is full", { status: 409 });
+    const playerIndex = this.availablePlayerIndex(role);
+    if (playerIndex === undefined) return new Response(this.room.started ? "No disconnected seat is available" : "Room is full", { status: 409 });
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
     this.sockets.set(server, { playerIndex, isHost: role === "host", nickname });
     this.room.players.set(playerIndex, nickname);
+    if (role === "player") this.rejoinableSeats.delete(playerIndex);
     if (role !== "host" && this.room.config) {
       this.refreshRoomConfigFromParticipants();
       this.broadcastRoomConfig();
@@ -91,6 +94,17 @@ export class Room {
   }
 
   nextSequence() { this.sequence += 1; return this.sequence; }
+
+  availablePlayerIndex(role) {
+    if (!this.room) return undefined;
+    const usedSeats = new Set([...this.sockets.values()].map((entry) => entry.playerIndex));
+    if (role === "host") return usedSeats.has(0) ? undefined : 0;
+    if (role !== "player") return undefined;
+    if (this.room.started) {
+      return [...this.rejoinableSeats].sort((a, b) => a - b).find((index) => !usedSeats.has(index));
+    }
+    return Array.from({ length: MAX_PLAYERS - 1 }, (_, i) => i + 1).find((index) => !usedSeats.has(index));
+  }
 
   playerNames() {
     const names = Array(MAX_PLAYERS).fill("");
@@ -209,9 +223,13 @@ export class Room {
       // Roles are fixed when the room is established. A connected client cannot mutate them via hostConfig.
       normalized.playerTypes = this.playerTypes();
       const requestedBoardSize = Number(message.boardSize);
-      normalized.boardSize = Number.isInteger(requestedBoardSize) && requestedBoardSize >= 5 && requestedBoardSize <= 12
-        ? requestedBoardSize
-        : (Number.isInteger(this.room.config?.boardSize) ? this.room.config.boardSize : 8);
+      // Board geometry is part of the active match state; changing it mid-game would
+      // make clients interpret the same snapshot with different dimensions.
+      normalized.boardSize = this.room.started
+        ? (Number.isInteger(this.room.config?.boardSize) ? this.room.config.boardSize : 8)
+        : (Number.isInteger(requestedBoardSize) && requestedBoardSize >= 5 && requestedBoardSize <= 12
+          ? requestedBoardSize
+          : (Number.isInteger(this.room.config?.boardSize) ? this.room.config.boardSize : 8));
       for (const [index, name] of this.room.players) {
         normalized.playerNames[index] = name;
         if (index === 0) {
@@ -325,9 +343,13 @@ export class Room {
       this.broadcast(packet("roomClosed", this.nextSequence(), { message: "房主已断开连接，对局已结束。" }));
       for (const peer of this.sockets.keys()) { try { peer.close(1000, "host left"); } catch {} }
       this.sockets.clear();
+      this.rejoinableSeats.clear();
       this.room = null;
       return;
     }
+
+    if (this.room.started) this.rejoinableSeats.add(participant.playerIndex);
+    else this.rejoinableSeats.delete(participant.playerIndex);
 
     if (this.room.config) {
       const playerTypes = this.playerTypes();

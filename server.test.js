@@ -285,3 +285,36 @@ test("host config ignores unknown player types and caps supplied nicknames", () 
   assert.equal(room.room.config.playerTypes[2], "算法-噩梦");
   assert.equal(guest.messages.at(-1).playerTypes[2], "算法-噩梦");
 });
+
+
+test("a started room admits only a participant returning to a disconnected seat", () => {
+  const { room, guest } = setupRoom();
+  room.room.started = false;
+  assert.equal(room.availablePlayerIndex("player"), 3);
+  room.room.started = true;
+  assert.equal(room.availablePlayerIndex("player"), undefined);
+
+  room.onClose(guest);
+  assert.equal(room.availablePlayerIndex("player"), 1);
+  assert.equal(room.room.config.playerTypes[1], "算法-噩梦");
+});
+
+
+test("the server freezes board size after a match starts", () => {
+  const { room, host, guest } = setupRoom();
+  room.room.config = {
+    boardSize: 8,
+    playerNames: ["Host", "Guest", "Observer"],
+    playerTypes: ["真人", "网络玩家", "网络玩家"],
+  };
+  room.room.started = true;
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "hostConfig", sequenceID: 50,
+    boardSize: 12,
+    playerNames: ["Host", "Guest", "Observer"],
+  }));
+
+  assert.equal(room.room.config.boardSize, 8);
+  assert.equal(host.messages.at(-1).boardSize, 8);
+  assert.equal(guest.messages.at(-1).boardSize, 8);
+});
