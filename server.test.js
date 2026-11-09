@@ -101,3 +101,17 @@ test("starting a new match invalidates the previous cached snapshot", () => {
   }));
   assert.equal(room.room.snapshot, null);
 });
+
+
+test("renamePlayer updates only the connected participant's assigned roster seat", () => {
+  const { room, host, guest, observer } = setupRoom();
+  room.onMessage(guest, JSON.stringify({
+    protocolVersion: 2, action: "renamePlayer", sequenceID: 3, playerIndex: 0, nickname: "  New Guest  ",
+  }));
+  assert.equal(room.room.players.get(1), "New Guest");
+  assert.equal(room.room.players.get(0), "Host");
+  for (const socket of [host, guest, observer]) {
+    assert.equal(socket.messages.at(-1).action, "roomRoster");
+    assert.equal(socket.messages.at(-1).playerNames[1], "New Guest");
+  }
+});

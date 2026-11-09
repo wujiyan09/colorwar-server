@@ -152,6 +152,15 @@ export class Room {
     }
     if (action === "leaveRoom") { try { socket.close(1000, "left room"); } catch {} return; }
 
+    if (action === "renamePlayer") {
+      const nickname = String(message.nickname || "").trim().slice(0, 32);
+      if (!nickname) return;
+      participant.nickname = nickname;
+      this.room.players.set(participant.playerIndex, nickname);
+      this.broadcastRoster();
+      return;
+    }
+
     if (action === "hostConfig") {
       if (!participant.isHost) return;
       const normalized = { ...message, sequenceID: this.nextSequence() };
