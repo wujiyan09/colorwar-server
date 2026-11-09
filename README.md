@@ -6,10 +6,10 @@ The Worker routes `wss://<deployed-host>/ws/<6-digit-room-code>?role=host|player
 
 1. Install Node.js 20+ and run `npm install` in this folder.
 2. Run `npx wrangler login` once, then `npm run deploy`.
-3. Copy the deployed `workers.dev` base URL into the Web app's “WebSocket 服务地址” field and the iOS app's “Worker 服务地址” field. Either `https://` or `wss://` is accepted; the clients open `/ws/<room-code>` automatically.
-4. Verify `https://<deployed-host>/health` returns the service name and protocol version 2.
+3. The currently deployed Worker is `https://colorwar-server.wujiyan2009.workers.dev`; both clients use it by default. Either `https://` or `wss://` is accepted; the clients open `/ws/<room-code>` automatically.
+4. Check `https://colorwar-server.wujiyan2009.workers.dev/health` for the service name and protocol version 2.
 
-This repository does not contain Cloudflare credentials or an account-specific `workers.dev` hostname; deploying is required before public rooms can connect.
+Deploy future server changes with `npm run deploy` from this folder after signing in to the owning Cloudflare account.
 
 ## Protocol
 
