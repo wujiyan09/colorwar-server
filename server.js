@@ -87,6 +87,22 @@ export default {
     if (url.pathname === "/health") {
       return Response.json({ service: "Color War WebSocket", protocolVersion: PROTOCOL_VERSION });
     }
+    const resumeMatch = url.pathname.match(/^\/resume-ticket\/([0-9]{6})\/?$/);
+    if (resumeMatch) {
+      const corsHeaders = {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "POST, OPTIONS",
+        "access-control-allow-headers": "content-type",
+        "access-control-max-age": "600",
+      };
+      if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: corsHeaders });
+      const id = env.ROOMS.idFromName(resumeMatch[1]);
+      const response = await env.ROOMS.get(id).fetch(request);
+      const headers = new Headers(response.headers);
+      for (const [key, value] of Object.entries(corsHeaders)) headers.set(key, value);
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    }
     const roomCode = roomCodeFromPath(url.pathname);
     if (!roomCode) return new Response("Use /ws/<six-digit-room-code>", { status: 404 });
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
@@ -118,7 +134,8 @@ export class Room {
       if (saved) await this.state.storage.delete("roomState");
       return;
     }
-    this.room = { ...saved, players: new Map(saved.players || []), activityTokens: saved.activityTokens || {} };
+    const resumeTickets = Object.fromEntries(Object.entries(saved.resumeTickets || {}).filter(([, expiresAt]) => expiresAt > Date.now()));
+    this.room = { ...saved, resumeTickets, players: new Map(saved.players || []), activityTokens: saved.activityTokens || {} };
     this.rejoinableSeats = new Set(saved.rejoinableSeats || []);
     this.sequence = saved.sequence || 0;
   }
@@ -138,6 +155,7 @@ export class Room {
       players: [...this.room.players.entries()],
       rejoinableSeats: [...this.rejoinableSeats],
       activityTokens: this.room.activityTokens || {},
+      resumeTickets: this.room.resumeTickets || {},
       sequence: this.sequence,
     };
     const writes = Promise.all([
@@ -167,6 +185,23 @@ export class Room {
   async fetch(request) {
     await this.ready;
     const url = new URL(request.url);
+    const resumeMatch = url.pathname.match(/^\/resume-ticket\/([0-9]{6})\/?$/);
+    if (resumeMatch && request.method === "POST") {
+      if (Number(request.headers.get("content-length") || 0) > 256) return new Response("Invalid resume token", { status: 400 });
+      const token = (await request.text()).trim();
+      if (token.length > 256) return new Response("Invalid resume token", { status: 400 });
+      if (!this.room || this.room.roomCode !== resumeMatch[1]) return new Response("Room not found", { status: 404 });
+      if (!token || token !== this.room.hostResumeToken) return new Response("Invalid resume token", { status: 403 });
+      if ([...this.sockets.values()].some((entry) => entry.isHost)) return new Response("Host is already connected", { status: 409 });
+      const now = Date.now();
+      const tickets = { ...(this.room.resumeTickets || {}) };
+      for (const [ticket, expiresAt] of Object.entries(tickets)) if (expiresAt <= now) delete tickets[ticket];
+      const ticket = crypto.randomUUID();
+      tickets[ticket] = now + 30_000;
+      this.room.resumeTickets = tickets;
+      this.persistRoom();
+      return Response.json({ ticket }, { headers: { "cache-control": "no-store" } });
+    }
     const roomCode = roomCodeFromPath(url.pathname);
     const role = url.searchParams.get("role");
     const nickname = (url.searchParams.get("nickname") || "玩家").trim().slice(0, 32) || "玩家";
@@ -174,17 +209,26 @@ export class Room {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("WebSocket upgrade required", { status: 426 });
 
     const hostResumeToken = request.headers.get("x-colorwar-host-token") || "";
+    const resumeTicket = url.searchParams.get("resumeTicket") || "";
     let resumedHost = false;
     if (role === "host") {
       if (this.room) {
         const existingHost = [...this.sockets.values()].some((entry) => entry.isHost);
-        if (!hostResumeToken || hostResumeToken !== this.room.hostResumeToken || existingHost) {
+        const tickets = { ...(this.room.resumeTickets || {}) };
+        const ticketExpiry = tickets[resumeTicket];
+        const ticketIsValid = Boolean(resumeTicket && ticketExpiry > Date.now());
+        const tokenIsValid = Boolean(hostResumeToken && hostResumeToken === this.room.hostResumeToken);
+        if ((!tokenIsValid && !ticketIsValid) || existingHost) {
           return new Response("Room code is already in use", { status: 409 });
+        }
+        if (ticketIsValid) {
+          delete tickets[resumeTicket];
+          this.room.resumeTickets = tickets;
         }
         resumedHost = true;
         if (this.room.started) this.room.movePending = false; // discard an interrupted, uncommitted move; snapshot is authoritative
       } else {
-        this.room = { roomCode, hostResumeToken: hostResumeToken || crypto.randomUUID(), started: false, firstPlayerIndex: 0, currentTurnIndex: null, movePending: false, config: null, snapshot: null, startPacket: null, players: new Map(), activityTokens: {}, expiresAt: Date.now() + 2 * 60 * 60 * 1000 };
+        this.room = { roomCode, hostResumeToken: hostResumeToken || crypto.randomUUID(), resumeTickets: {}, started: false, firstPlayerIndex: 0, currentTurnIndex: null, movePending: false, config: null, snapshot: null, startPacket: null, players: new Map(), activityTokens: {}, expiresAt: Date.now() + 2 * 60 * 60 * 1000 };
         this.rejoinableSeats.clear();
       }
     } else if (!this.room) {
@@ -213,6 +257,7 @@ export class Room {
       roomCode,
       playerIndex,
       isHost: role === "host",
+      roomStarted: Boolean(this.room.started),
       ...(role === "host" ? { hostResumeToken: this.room.hostResumeToken } : {}),
       playerNames: this.playerNames(),
       playerTypes: this.playerTypes(),
@@ -581,6 +626,7 @@ export class Room {
       }
       this.room.players.set(0, participant.nickname);
       this.broadcast(packet("hostDisconnected", this.nextSequence(), { playerIndex: 0, message: "房主暂时断线，等待重新连接。" }));
+      if (this.room.snapshot) this.broadcast({ ...this.room.snapshot, sequenceID: this.nextSequence() });
       this.persistRoom();
       if (this.room.snapshot) {
         const pushWork = this.pushLiveActivityUpdates(this.room.currentTurnIndex);

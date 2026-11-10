@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Room, buildActivityContentState, isValidActivityPushToken, shouldAlertForActivityTurn } from "./server.js";
+import worker, { Room, buildActivityContentState, isValidActivityPushToken, shouldAlertForActivityTurn } from "./server.js";
 
 class FakeSocket {
   messages = [];
@@ -217,8 +217,27 @@ test("a host transport disconnect preserves the room and last snapshot for resum
   assert.equal(room.room.hostResumeToken, "secret-resume-token");
   assert.deepEqual(room.room.snapshot.compactBoardSnapshot, [{ r: 0, c: 0, owner: 1, count: 1 }]);
   assert.equal(room.rejoinableSeats.has(0), true);
-  assert.equal(guest.messages.at(-1).action, "hostDisconnected");
-  assert.equal(observer.messages.at(-1).action, "hostDisconnected");
+  for (const socket of [guest, observer]) {
+    assert.ok(socket.messages.some((message) => message.action === "hostDisconnected"));
+    assert.equal(socket.messages.at(-1).action, "stateSnapshot");
+    assert.deepEqual(socket.messages.at(-1).compactBoardSnapshot, [{ r: 0, c: 0, owner: 1, count: 1 }]);
+  }
+});
+
+test("web host resume tickets require the secret token and expire after one use window", async () => {
+  const { room, host } = setupRoom();
+  room.room.hostResumeToken = "web-host-secret";
+  const endpoint = "https://worker.example/resume-ticket/123456";
+  const denied = await room.fetch(new Request(endpoint, { method: "POST", body: "wrong-token" }));
+  assert.equal(denied.status, 403);
+  const connected = await room.fetch(new Request(endpoint, { method: "POST", body: "web-host-secret" }));
+  assert.equal(connected.status, 409);
+  room.sockets.delete(host);
+  const issued = await room.fetch(new Request(endpoint, { method: "POST", body: "web-host-secret" }));
+  assert.equal(issued.status, 200);
+  const { ticket } = await issued.json();
+  assert.match(ticket, /^[0-9a-f-]{36}$/i);
+  assert.ok(room.room.resumeTickets[ticket] > Date.now());
 });
 
 test("guests cannot claim the temporarily disconnected host seat", () => {
@@ -481,4 +500,30 @@ test("Live Activity turn alert is sent only when the registered player's turn be
   assert.equal(shouldAlertForActivityTurn(0, 0, 1), false);
   assert.equal(shouldAlertForActivityTurn(1, 1, 1), false);
   assert.equal(shouldAlertForActivityTurn(1, null, 1), true);
+});
+
+
+test("web resume-ticket endpoint supports browser CORS preflight and POST", async () => {
+  const forwarded = [];
+  const env = {
+    ROOMS: {
+      idFromName(code) { return code; },
+      get(id) {
+        return {
+          async fetch(request) {
+            forwarded.push({ id, method: request.method, body: request.method === "POST" ? await request.text() : "" });
+            return Response.json({ ticket: "short-lived-ticket" });
+          },
+        };
+      },
+    },
+  };
+  const preflight = await worker.fetch(new Request("https://worker.example/resume-ticket/123456", { method: "OPTIONS" }), env);
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), "*");
+  assert.match(preflight.headers.get("access-control-allow-methods"), /POST/);
+  const response = await worker.fetch(new Request("https://worker.example/resume-ticket/123456", { method: "POST", body: "host-secret" }), env);
+  assert.equal(response.headers.get("access-control-allow-origin"), "*");
+  assert.deepEqual(await response.json(), { ticket: "short-lived-ticket" });
+  assert.deepEqual(forwarded, [{ id: "123456", method: "POST", body: "host-secret" }]);
 });
