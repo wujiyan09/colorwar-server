@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Room } from "./server.js";
+import { Room, buildActivityContentState, isValidActivityPushToken, shouldAlertForActivityTurn } from "./server.js";
 
 class FakeSocket {
   messages = [];
@@ -206,11 +206,68 @@ test("guest move reaches host and observers; final authoritative chain snapshot 
 });
 
 
-test("disconnecting the host explicitly notifies remaining room members", () => {
+test("a host transport disconnect preserves the room and last snapshot for resume", () => {
+  const { room, host, guest, observer } = setupRoom();
+  room.room.hostResumeToken = "secret-resume-token";
+  room.room.movePending = true;
+  room.room.snapshot = { action: "stateSnapshot", currentTurnIndex: 1, compactBoardSnapshot: [{ r: 0, c: 0, owner: 1, count: 1 }] };
+  room.onClose(host);
+  assert.ok(room.room, "room remains live");
+  assert.equal(room.room.movePending, false, "uncommitted move is discarded");
+  assert.equal(room.room.hostResumeToken, "secret-resume-token");
+  assert.deepEqual(room.room.snapshot.compactBoardSnapshot, [{ r: 0, c: 0, owner: 1, count: 1 }]);
+  assert.equal(room.rejoinableSeats.has(0), true);
+  assert.equal(guest.messages.at(-1).action, "hostDisconnected");
+  assert.equal(observer.messages.at(-1).action, "hostDisconnected");
+});
+
+test("guests cannot claim the temporarily disconnected host seat", () => {
+  const { room, host } = setupRoom();
+  room.onClose(host);
+  assert.equal(room.availablePlayerIndex("player"), undefined);
+});
+
+test("moves are rejected while the host is disconnected", () => {
   const { room, host, guest } = setupRoom();
   room.onClose(host);
-  assert.equal(guest.messages.at(-1).action, "roomClosed");
-  assert.equal(guest.messages.at(-1).message, "房主已断开连接，对局已结束。");
+  room.onMessage(guest, move(1));
+  assert.equal(room.room.movePending, false);
+  assert.equal(guest.messages.at(-1).action, "hostDisconnected");
+});
+
+test("Durable Object storage restores room, sequence and rejoinable seats", async () => {
+  const values = new Map();
+  const pending = [];
+  const state = {
+    storage: {
+      async get(key) { return values.get(key); },
+      async put(key, value) { values.set(key, structuredClone(value)); },
+      async delete(key) { values.delete(key); },
+      async setAlarm(value) { state.alarmAt = value; },
+    },
+    waitUntil(promise) { pending.push(promise); },
+  };
+  const original = new Room(state);
+  original.room = {
+    roomCode: "123456", started: true, firstPlayerIndex: 0, currentTurnIndex: 2,
+    movePending: false, hostResumeToken: "resume-token", config: { boardSize: 8 },
+    snapshot: { action: "stateSnapshot", currentTurnIndex: 2 }, startPacket: { action: "startGame" },
+    players: new Map([[0, "Host"], [1, "Guest"]]), activityTokens: { "1": "ab".repeat(32) },
+  };
+  original.rejoinableSeats.add(0);
+  original.rejoinableSeats.add(1);
+  original.sequence = 42;
+  original.persistRoom();
+  await Promise.all(pending);
+  const restored = new Room(state);
+  await restored.ready;
+  assert.equal(restored.room.roomCode, "123456");
+  assert.equal(restored.room.hostResumeToken, "resume-token");
+  assert.equal(restored.room.players.get(1), "Guest");
+  assert.equal(restored.room.activityTokens["1"], "ab".repeat(32));
+  assert.equal(restored.sequence, 42);
+  assert.deepEqual([...restored.rejoinableSeats].sort(), [0, 1]);
+  assert.ok(state.alarmAt > Date.now());
 });
 
 test("a departed guest is server-assigned AI in-game, without opening role edits", () => {
@@ -345,4 +402,83 @@ test("the server freezes board size after a match starts", () => {
   assert.equal(room.room.config.boardSize, 8);
   assert.equal(host.messages.at(-1).boardSize, 8);
   assert.equal(guest.messages.at(-1).boardSize, 8);
+});
+
+
+test("accepts only hex ActivityKit push tokens of a plausible APNs token length", () => {
+  assert.equal(isValidActivityPushToken("a".repeat(64)), true);
+  assert.equal(isValidActivityPushToken("F".repeat(256)), true);
+  assert.equal(isValidActivityPushToken("a".repeat(63)), false);
+  assert.equal(isValidActivityPushToken("g".repeat(64)), false);
+  assert.equal(isValidActivityPushToken(null), false);
+});
+
+test("builds compact Live Activity board state with turn and palette data", () => {
+  const state = buildActivityContentState({
+    boardSize: 5, currentTurnIndex: 1, playerNames: ["Host", "Guest"],
+    colorsHex: ["FF0000FF", "00AAFFFF"],
+    compactBoardSnapshot: [
+      { r: 0, c: 0, owner: 0, count: 1 },
+      { r: 2, c: 3, owner: 1, count: 3 },
+      { r: 9, c: 9, owner: 2, count: 1 },
+    ],
+  }, 1);
+  assert.equal(state.boardRows.length, 5);
+  assert.equal(state.boardRows[0][0], "1");
+  assert.equal(state.boardRows[2][3], "7");
+  assert.equal(state.boardRows[4], "00000");
+  assert.equal(state.currentPlayerName, "Guest");
+  assert.equal(state.isMyTurn, true);
+  assert.equal(state.status, "轮到你了");
+  const paused = buildActivityContentState({ boardSize: 5, currentTurnIndex: 1 }, 1, true);
+  assert.equal(paused.status, "房主断线，等待恢复");
+  assert.equal(paused.isMyTurn, false);
+  assert.equal(state.colors[0], "FF0000");
+  assert.equal(state.colors[7], "808080");
+  assert.equal(buildActivityContentState({ boardSize: 99 }, 0), null);
+});
+
+test("activity token registration can only bind a valid token to the connected player's own seat", () => {
+  const { room, guest, host } = setupRoom();
+  room.room.activityTokens = {};
+  const token = "ab".repeat(32);
+  room.onMessage(guest, JSON.stringify({
+    protocolVersion: 2, action: "activityToken", roomCode: "123456", playerIndex: 1, activityPushToken: token,
+  }));
+  assert.equal(room.room.activityTokens["1"], token);
+  room.onMessage(guest, JSON.stringify({
+    protocolVersion: 2, action: "activityToken", roomCode: "123456", playerIndex: 0, activityPushToken: "cd".repeat(32),
+  }));
+  room.onMessage(host, JSON.stringify({
+    protocolVersion: 2, action: "activityToken", roomCode: "123456", playerIndex: 1, activityPushToken: "ef".repeat(32),
+  }));
+  room.onMessage(guest, JSON.stringify({
+    protocolVersion: 2, action: "activityToken", roomCode: "123456", playerIndex: 1, activityPushToken: "not-a-token",
+  }));
+  assert.equal(room.room.activityTokens["0"], undefined);
+  assert.equal(room.room.activityTokens["1"], token);
+});
+
+test("Live Activity push is safely disabled until APNs secrets are configured", async () => {
+  const { room } = setupRoom();
+  room.env = {};
+  room.room.snapshot = { boardSize: 5, currentTurnIndex: 0, compactBoardSnapshot: [] };
+  room.room.activityTokens = { "0": "ab".repeat(32) };
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; throw new Error("unexpected fetch"); };
+  try {
+    await room.pushLiveActivityUpdates();
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("Live Activity turn alert is sent only when the registered player's turn begins", () => {
+  assert.equal(shouldAlertForActivityTurn(1, 0, 1), true);
+  assert.equal(shouldAlertForActivityTurn(0, 0, 1), false);
+  assert.equal(shouldAlertForActivityTurn(1, 1, 1), false);
+  assert.equal(shouldAlertForActivityTurn(1, null, 1), true);
 });
