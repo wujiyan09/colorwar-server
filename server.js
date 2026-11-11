@@ -12,81 +12,6 @@ function packet(action, sequenceID, fields = {}) {
   return { protocolVersion: PROTOCOL_VERSION, sequenceID, action, senderID: "server", ...fields };
 }
 
-export function normalizeClockConfig(value) {
-  const modes = new Set(["untimed", "fixed", "fischer", "byoyomi", "bronstein"]);
-  const mode = modes.has(value?.mode) ? value.mode : "untimed";
-  const clamp = (v, max = 86400) => Number.isFinite(Number(v)) ? Math.max(0, Math.min(max, Math.floor(Number(v)))) : 0;
-  const times = Array.isArray(value?.initialSeconds) ? value.initialSeconds : [];
-  return { mode, initialSeconds: Array.from({ length: MAX_PLAYERS }, (_, i) => clamp(times[i] ?? 600)),
-    incrementSeconds: clamp(value?.incrementSeconds, 3600), delaySeconds: clamp(value?.delaySeconds, 3600),
-    byoPeriodSeconds: Math.max(1, clamp(value?.byoPeriodSeconds ?? 30, 3600)),
-    byoPeriods: Math.max(1, Math.min(20, clamp(value?.byoPeriods ?? 3, 20))) };
-}
-
-export function createClockState(configValue, activePlayer, now = Date.now()) {
-  const config = normalizeClockConfig(configValue);
-  return { config, remainingSeconds: [...config.initialSeconds], moveCounts: Array(MAX_PLAYERS).fill(0),
-    periodsRemaining: Array(MAX_PLAYERS).fill(config.byoPeriods),
-    periodRemaining: Array(MAX_PLAYERS).fill(config.byoPeriodSeconds),
-    activePlayer, running: config.mode !== "untimed", paused: config.mode === "untimed", startedAt: now, expiredPlayer: null };
-}
-
-function chargeClockElapsed(state, now) {
-  const p = state.activePlayer;
-  const cfg = state.config;
-  const elapsed = Math.max(0, (now - state.startedAt) / 1000);
-  let charge = cfg.mode === "bronstein" ? Math.max(0, elapsed - cfg.delaySeconds) : elapsed;
-  if (state.remainingSeconds[p] > 0) {
-    const used = Math.min(state.remainingSeconds[p], charge);
-    state.remainingSeconds[p] = Math.max(0, state.remainingSeconds[p] - used);
-    charge -= used;
-  }
-  if (cfg.mode === "byoyomi" && state.remainingSeconds[p] <= 0) {
-    let period = state.periodRemaining[p] - charge;
-    while (period <= 0 && state.periodsRemaining[p] > 1) {
-      period += cfg.byoPeriodSeconds;
-      state.periodsRemaining[p] -= 1;
-    }
-    if (period <= 0) {
-      state.periodRemaining[p] = 0;
-      state.periodsRemaining[p] = 0;
-      state.expiredPlayer = p;
-      state.running = false;
-      state.paused = true;
-      state.updatedAt = now;
-      return false;
-    }
-    state.periodRemaining[p] = period;
-  } else if (state.remainingSeconds[p] <= 0) {
-    state.expiredPlayer = p;
-    state.running = false;
-    state.paused = true;
-    state.updatedAt = now;
-    return false;
-  }
-  state.updatedAt = now;
-  return true;
-}
-
-export function settleClockTurn(state, nextPlayer, now = Date.now()) {
-  if (!state || nextPlayer === state.activePlayer) return state;
-  const p = state.activePlayer;
-  const cfg = state.config;
-  if (cfg.mode !== "untimed") {
-    if (!state.running || state.paused || state.expiredPlayer !== null || !chargeClockElapsed(state, now)) return state;
-    if (cfg.mode === "byoyomi" && state.remainingSeconds[p] <= 0) {
-      // A legal move replenishes the current byo-yomi period.
-      state.periodRemaining[p] = cfg.byoPeriodSeconds;
-    }
-    if (cfg.mode === "fischer") state.remainingSeconds[p] += cfg.incrementSeconds;
-  }
-  state.moveCounts[p] += 1;
-  state.activePlayer = nextPlayer;
-  state.startedAt = now;
-  state.updatedAt = now;
-  return state;
-}
-
 function roomCodeFromPath(pathname) {
   const match = pathname.match(/^\/ws\/([0-9]{6})\/?$/);
   return match?.[1] ?? null;
@@ -431,7 +356,6 @@ export class Room {
     }
     if (this.room.started && this.room.startPacket) {
       this.send(socket, { ...this.room.startPacket, sequenceID: this.nextSequence() });
-      if (this.room.clockState) this.send(socket, packet("clockState", this.nextSequence(), { clockState: this.room.clockState }));
       if (this.room.snapshot) {
         this.send(socket, { ...this.room.snapshot, sequenceID: this.nextSequence() });
       }
@@ -532,44 +456,9 @@ export class Room {
         normalized.playerNames[index] = name;
         normalized.playerTypes[index] = index === 0 ? PLAYER_TYPES.human : PLAYER_TYPES.network;
       }
-      normalized.clockConfig = this.room.started && this.room.clockState?.running && !this.room.clockState?.paused
-        ? normalizeClockConfig(this.room.config?.clockConfig)
-        : normalizeClockConfig(message.clockConfig ?? this.room.config?.clockConfig);
       this.room.config = normalized;
       // Echo the canonical role assignment to the host too, correcting stale or tampered local state.
       this.broadcast(normalized);
-      this.persistRoom();
-      return;
-    }
-
-    if (action === "clockControl") {
-      if (!this.room.started || !this.room.clockState) return;
-      const command = message.command;
-      const now = Date.now();
-      const state = this.room.clockState;
-      if (command === "configure") {
-        if (state.running && !state.paused) return;
-        const config = normalizeClockConfig(message.clockConfig);
-        this.room.config.clockConfig = config;
-        this.room.clockState = createClockState(config, this.room.currentTurnIndex, now);
-        this.room.clockState.running = false; this.room.clockState.paused = true;
-      } else if (command === "pause") {
-        if (state.running && !state.paused) {
-          chargeClockElapsed(state, now);
-          state.running = false; state.paused = true; state.startedAt = now;
-        }
-      } else if (command === "resume") {
-        if (state.expiredPlayer === null) {
-          state.running = state.config.mode !== "untimed";
-          state.paused = false;
-          state.startedAt = now;
-        }
-      } else if (command === "reset") {
-        this.room.clockState = createClockState(state.config, this.room.currentTurnIndex, now);
-        this.room.clockState.running = false; this.room.clockState.paused = true;
-      } else return;
-      this.room.clockState.updatedAt = now;
-      this.broadcast(packet("clockState", this.nextSequence(), { clockState: this.room.clockState }));
       this.persistRoom();
       return;
     }
@@ -584,7 +473,6 @@ export class Room {
       this.room.movePending = false;
       this.room.snapshot = null;
       this.room.currentTurnIndex = firstPlayerIndex;
-      this.room.clockState = createClockState(this.room.config.clockConfig, firstPlayerIndex);
       const configuredBoardSize = this.room.config?.boardSize;
       this.room.startPacket = {
         ...message,
@@ -597,14 +485,13 @@ export class Room {
         sequenceID: this.nextSequence(),
       };
       this.broadcast(this.room.startPacket, socket);
-      this.broadcast(packet("clockState", this.nextSequence(), { clockState: this.room.clockState }));
       this.persistRoom();
       return;
     }
 
     if (action === "stateSnapshot") {
       if (!participant.isHost || !this.room.started || !Array.isArray(message.compactBoardSnapshot)) return;
-      let currentTurnIndex = Number(message.currentTurnIndex);
+      const currentTurnIndex = Number(message.currentTurnIndex);
       if (!Number.isInteger(currentTurnIndex) || currentTurnIndex < 0 || currentTurnIndex >= MAX_PLAYERS) return;
       const turnType = this.room.config?.playerTypes?.[currentTurnIndex];
       if (turnType === undefined || turnType === PLAYER_TYPES.disabled) return;
@@ -623,22 +510,6 @@ export class Room {
         })
         .slice(0, boardSize * boardSize);
       const previousTurnIndex = this.room.currentTurnIndex;
-      if (this.room.clockState && currentTurnIndex !== previousTurnIndex) {
-        const clock = this.room.clockState;
-        if (clock.config.mode !== "untimed" && (!clock.running || clock.paused || clock.expiredPlayer !== null)) return;
-        settleClockTurn(clock, currentTurnIndex, Date.now());
-        if (this.room.clockState.expiredPlayer !== null) {
-          this.room.clockState.running = false;
-          this.room.clockState.paused = true;
-          this.room.clockState.updatedAt = Date.now();
-          this.broadcast(packet("clockState", this.nextSequence(), { clockState: this.room.clockState }));
-          this.persistRoom();
-          return;
-        }
-        this.room.clockState.running = this.room.clockState.config.mode !== "untimed";
-        this.room.clockState.paused = !this.room.clockState.running;
-        this.room.clockState.updatedAt = Date.now();
-      }
       this.room.snapshot = {
         ...(this.room.config || {}),
         ...message,
@@ -649,12 +520,11 @@ export class Room {
         colorsHex: Array.isArray(message.colorsHex) ? message.colorsHex.slice(0, MAX_PLAYERS) : [],
         compactBoardSnapshot,
         currentTurnIndex,
-        clockState: this.room.clockState,
         sequenceID: this.nextSequence(),
       };
       this.room.currentTurnIndex = currentTurnIndex;
       this.room.movePending = false;
-      this.broadcast(this.room.snapshot);
+      this.broadcast(this.room.snapshot, socket);
       this.persistRoom();
       const pushWork = this.pushLiveActivityUpdates(previousTurnIndex);
       if (typeof this.state.waitUntil === "function") this.state.waitUntil(pushWork);
@@ -677,19 +547,6 @@ export class Room {
       const playerIndex = Number(message.playerIndex);
       if (!this.room.started || this.room.movePending || !Number.isInteger(playerIndex)) return;
       if (playerIndex !== this.room.currentTurnIndex) return;
-      const clock = this.room.clockState;
-      if (clock && clock.config.mode !== "untimed" && (clock.paused || !clock.running || clock.expiredPlayer !== null)) return;
-      if (clock?.running && !clock.paused) {
-        const projected = { ...this.room.clockState, remainingSeconds: [...this.room.clockState.remainingSeconds],
-          moveCounts: [...this.room.clockState.moveCounts], periodsRemaining: [...this.room.clockState.periodsRemaining],
-          periodRemaining: [...this.room.clockState.periodRemaining] };
-        if (!chargeClockElapsed(projected, Date.now())) {
-          this.room.clockState = projected;
-          this.broadcast(packet("clockState", this.nextSequence(), { clockState: projected }));
-          this.persistRoom();
-          return;
-        }
-      }
       const isOwnSeat = playerIndex === participant.playerIndex;
       const playerType = this.room.config?.playerTypes?.[playerIndex];
       const isAI = playerType === PLAYER_TYPES.mathNightmare || playerType === PLAYER_TYPES.enhancedNightmare;

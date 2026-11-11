@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { Room, buildActivityContentState, createClockState, normalizeClockConfig, settleClockTurn, isValidActivityPushToken, shouldAlertForActivityTurn } from "./server.js";
+import worker, { Room, buildActivityContentState, isValidActivityPushToken, shouldAlertForActivityTurn } from "./server.js";
 
 class FakeSocket {
   messages = [];
@@ -127,7 +127,7 @@ test("startGame carries the host's canonical board size to guests", () => {
   }));
   assert.equal(room.room.startPacket.action, "startGame");
   assert.equal(room.room.startPacket.boardSize, 10);
-  assert.equal(guest.messages.find((item) => item.action === "startGame").boardSize, 10);
+  assert.equal(guest.messages.at(-1).boardSize, 10);
 });
 
 
@@ -327,7 +327,7 @@ test("host configuration normalizes board size and fixed-size roster arrays", ()
   assert.equal(room.room.config.boardSize, 10);
   assert.equal(room.room.config.playerNames.length, 8);
   assert.equal(room.room.config.playerTypes.length, 8);
-  assert.equal(guest.messages.find((item) => item.action === "hostConfig").boardSize, 10);
+  assert.equal(guest.messages.at(-1).boardSize, 10);
 });
 
 test("rejects moves outside the configured board", () => {
@@ -526,94 +526,4 @@ test("web resume-ticket endpoint supports browser CORS preflight and POST", asyn
   assert.equal(response.headers.get("access-control-allow-origin"), "*");
   assert.deepEqual(await response.json(), { ticket: "short-lived-ticket" });
   assert.deepEqual(forwarded, [{ id: "123456", method: "POST", body: "host-secret" }]);
-});
-
-
-test("clock config defaults to untimed and bounds player settings", () => {
-  assert.equal(normalizeClockConfig(null).mode, "untimed");
-  const config = normalizeClockConfig({ mode: "fischer", initialSeconds: [-1, 999999], incrementSeconds: 5 });
-  assert.deepEqual(config.initialSeconds.slice(0, 2), [0, 86400]);
-  assert.equal(config.incrementSeconds, 5);
-});
-
-test("server chess clock settles elapsed time and Fischer increment authoritatively", () => {
-  const state = createClockState({ mode: "fischer", initialSeconds: [60, 60], incrementSeconds: 3 }, 0, 1000);
-  settleClockTurn(state, 1, 11000);
-  assert.equal(state.remainingSeconds[0], 53);
-  assert.equal(state.moveCounts[0], 1);
-  assert.equal(state.activePlayer, 1);
-  assert.equal(state.startedAt, 11000);
-});
-
-test("server clockControl pauses/resumes and broadcasts canonical state", () => {
-  const { room, host, guest } = setupRoom();
-  room.room.config.clockConfig = { mode: "fixed", initialSeconds: Array(8).fill(60) };
-  room.room.clockState = createClockState(room.room.config.clockConfig, 1, Date.now() - 2000);
-  room.onMessage(guest, JSON.stringify({ protocolVersion: 2, action: "clockControl", command: "pause" }));
-  assert.equal(room.room.clockState.paused, true);
-  assert.ok(room.room.clockState.remainingSeconds[1] < 60);
-  assert.equal(host.messages.at(-1).action, "clockState");
-  room.onMessage(host, JSON.stringify({ protocolVersion: 2, action: "clockControl", command: "resume" }));
-  assert.equal(room.room.clockState.running, true);
-  assert.equal(guest.messages.at(-1).action, "clockState");
-});
-
-
-test("untimed turns still update the authoritative move counter", () => {
-  const state = createClockState({ mode: "untimed" }, 0, 1000);
-  settleClockTurn(state, 1, 5000);
-  assert.equal(state.moveCounts[0], 1);
-  assert.equal(state.activePlayer, 1);
-  assert.equal(state.running, false);
-});
-
-test("byo-yomi and Bronstein settle the remaining time correctly", () => {
-  const byo = createClockState({ mode: "byoyomi", initialSeconds: [5, 5], byoPeriodSeconds: 10, byoPeriods: 3 }, 0, 1000);
-  settleClockTurn(byo, 1, 9000);
-  assert.equal(byo.remainingSeconds[0], 0);
-  assert.equal(byo.periodRemaining[0], 10);
-  assert.equal(byo.periodsRemaining[0], 3);
-  assert.equal(byo.moveCounts[0], 1);
-  const bronstein = createClockState({ mode: "bronstein", initialSeconds: [60, 60], delaySeconds: 3 }, 0, 1000);
-  settleClockTurn(bronstein, 1, 11000);
-  assert.equal(bronstein.remainingSeconds[0], 53);
-});
-
-test("timed-out or paused online turns cannot advance", () => {
-  const { room, host, guest } = setupRoom();
-  room.room.started = true;
-  room.room.currentTurnIndex = 0;
-  room.room.config = { playerTypes: ["真人", "网络玩家"], boardSize: 8, clockConfig: { mode: "fixed" } };
-  room.room.clockState = createClockState({ mode: "fixed", initialSeconds: [60, 60] }, 0);
-  room.room.clockState.running = false;
-  room.room.clockState.paused = true;
-  room.onMessage(host, JSON.stringify({ protocolVersion: 2, action: "stateSnapshot", currentTurnIndex: 1, compactBoardSnapshot: [] }));
-  assert.equal(room.room.snapshot, null);
-  assert.equal(room.room.currentTurnIndex, 0);
-  room.onMessage(host, JSON.stringify({ protocolVersion: 2, action: "playerMove", playerIndex: 0, row: 0, col: 0 }));
-  assert.equal(host.messages.length, 0);
-});
-
-test("server rejects late timed moves and publishes the authoritative timeout", () => {
-  const { room, host, guest } = setupRoom();
-  room.room.currentTurnIndex = 1;
-  room.room.config = { playerTypes: ["真人", "网络玩家", "算法-噩梦", "未加入"], boardSize: 8 };
-  room.room.clockState = createClockState({ mode: "fixed", initialSeconds: [60, 1] }, 1, Date.now() - 2500);
-  room.onMessage(guest, move(1));
-  assert.equal(room.room.movePending, false);
-  assert.equal(room.room.clockState.expiredPlayer, 1);
-  assert.equal(guest.messages.at(-1).action, "clockState");
-  assert.equal(host.messages.some((item) => item.action === "playerMove"), false);
-});
-
-test("server rejects a late authoritative board snapshot instead of advancing the timed turn", () => {
-  const { room, host, guest } = setupRoom();
-  room.room.currentTurnIndex = 0;
-  room.room.config = { playerTypes: ["真人", "网络玩家"], boardSize: 8 };
-  room.room.clockState = createClockState({ mode: "fixed", initialSeconds: [1, 60] }, 0, Date.now() - 2500);
-  room.onMessage(host, JSON.stringify({ protocolVersion: 2, action: "stateSnapshot", currentTurnIndex: 1, compactBoardSnapshot: [] }));
-  assert.equal(room.room.snapshot, null);
-  assert.equal(room.room.currentTurnIndex, 0);
-  assert.equal(room.room.clockState.expiredPlayer, 0);
-  assert.equal(guest.messages.at(-1).action, "clockState");
 });
