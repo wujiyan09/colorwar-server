@@ -107,3 +107,18 @@ test("register, login, profile, matches, leaderboard, friends, invites", async (
   r = await call(acc, "GET", "/api/me", null, "bad");
   assert.equal(r.status, 401);
 });
+
+test("delete account removes user data and requires password", async () => {
+  const acc = await makeAccounts();
+  let r = await call(acc, "POST", "/api/register", { username: "Del", password: "secret1", confirmPassword: "secret1" });
+  const tok = r.data.token;
+  await call(acc, "POST", "/api/matches", { matches: [{ id: "match-x1", playedAt: Date.now(), mode: "vsAI", players: 2, boardSize: 6, aiKey: "bot1-l1", moves: 10, result: "win" }] }, tok);
+  r = await call(acc, "POST", "/api/me/delete", { password: "wrong" }, tok);
+  assert.equal(r.status, 403);
+  r = await call(acc, "POST", "/api/me/delete", { password: "secret1" }, tok);
+  assert.equal(r.status, 200);
+  r = await call(acc, "GET", "/api/me", null, tok);
+  assert.equal(r.status, 401);
+  r = await call(acc, "POST", "/api/login", { username: "Del", password: "secret1" });
+  assert.equal(r.status, 401);
+});

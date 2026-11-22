@@ -263,6 +263,7 @@ export class Accounts {
     }
     if (path === "/api/me" && method === "GET") return json({ user: this.privateUser(me) });
     if (path === "/api/me" && method === "PATCH") return this.updateMe(me, await this.body(request));
+    if (path === "/api/me/delete" && method === "POST") return this.deleteAccount(me, await this.body(request));
     if (path === "/api/me/password" && method === "POST") return this.setPassword(me, await this.body(request));
     if (path === "/api/matches" && method === "POST") return this.addMatches(me, await this.body(request));
     if (path === "/api/matches" && method === "GET") return this.listMatches(me, url);
@@ -348,6 +349,31 @@ export class Accounts {
     }
     const { hash, salt } = await hashPassword(body.password);
     this.sql.exec(`UPDATE users SET pw_hash = ?, pw_salt = ? WHERE id = ?`, hash, salt, me.id);
+    return json({ ok: true });
+  }
+
+  // 注销账号：要求密码确认；删除本人所有数据，并把别人战绩里出现的名字匿名化
+  async deleteAccount(me, body) {
+    if (me.pw_hash && !(await verifyPassword(String(body.password || ""), me.pw_hash, me.pw_salt))) throw new HttpError(403, "密码不正确");
+    const id = me.id, name = me.username;
+    this.sql.exec(`DELETE FROM matches WHERE user_id = ?`, id);
+    const others = this.q(`SELECT user_id, id, detail FROM matches WHERE detail LIKE ?`, `%${name}%`);
+    for (const r of others) {
+      try {
+        const d = JSON.parse(r.detail);
+        let changed = false;
+        if (Array.isArray(d.names)) d.names = d.names.map((n) => (n === name ? (changed = true, "已注销用户") : n));
+        if (d.winnerName === name) { d.winnerName = "已注销用户"; changed = true; }
+        if (changed) this.sql.exec(`UPDATE matches SET detail = ? WHERE user_id = ? AND id = ?`, JSON.stringify(d), r.user_id, r.id);
+      } catch {}
+    }
+    this.sql.exec(`DELETE FROM sessions WHERE user_id = ?`, id);
+    this.sql.exec(`DELETE FROM friends WHERE a = ? OR b = ?`, id, id);
+    this.sql.exec(`DELETE FROM invites WHERE from_id = ? OR to_id = ?`, id, id);
+    this.sql.exec(`DELETE FROM push_tokens WHERE user_id = ?`, id);
+    this.sql.exec(`DELETE FROM bark_keys WHERE user_id = ?`, id);
+    this.sql.exec(`DELETE FROM login_failures WHERE key = ?`, `user:${me.username_key || name.toLowerCase()}`);
+    this.sql.exec(`DELETE FROM users WHERE id = ?`, id);
     return json({ ok: true });
   }
 
