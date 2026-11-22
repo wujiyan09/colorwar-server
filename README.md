@@ -38,3 +38,15 @@ npx wrangler secret put APNS_BUNDLE_ID
 `APNS_PRIVATE_KEY` is the `.p8` key contents and must never be committed. The app registers ActivityKit push tokens; it does not expose APNs credentials. Set optional `APNS_HOST` to exactly `https://api.push.apple.com` (production, default) or `https://api.sandbox.push.apple.com` (development), matching the token environment. The sample XcodeGen project uses `com.example.ColorWarAI`; replace it with the actual app identifier before signing and distribution. `ColorWarAI.entitlements` is a development template; use a production entitlement/provisioning profile for distribution. An unsigned IPA cannot register APNs tokens or receive operational pushes.
 
 The server may retain a room for up to two hours and can restore its last committed snapshot when the host reconnects. An interrupted, not-yet-snapshotted move is discarded. This is the practical mitigation for app suspension; iOS may suspend the app, delay or throttle pushes, so a permanently live WebSocket is not achievable through APNs. The XcodeGen project/workflow has not been executed here; build and physical-device validation still require macOS with Xcode, valid signing, configured secrets and a deployed server.
+
+## Accounts API (`/api/*`)
+
+All account data lives in a SQLite-backed Durable Object (`Accounts`, binding `ACCOUNTS`, object name `global`). No D1 or KV setup is needed; Workers Builds deploys the new class with migration `v2`.
+
+- `POST /api/register {username, password, confirmPassword}` / `POST /api/login {username, password}` → `{token, user}`. Send `Authorization: Bearer <token>` afterwards.
+- Passwords are currently stored as plain text on purpose. Replace `hashPassword` / `verifyPassword` in `accounts.js` to add hashing.
+- `GET/PATCH /api/me {username?, avatar?, barkKey?}`; avatar is `emoji:<emoji>:#RRGGBB` or a small `data:image/jpeg;base64,...`.
+- `POST /api/matches {matches:[...]}` (idempotent by client id), `GET /api/matches?limit=&before=`.
+- `GET /api/leaderboard?period=week|month|season|year&aiKey=&limit=5|100`. Rule lives in `LEADERBOARD_RULE`: only 1 human vs 1 AI 2-player games, one board per AI difficulty, wins desc then average moves per game desc, at least 3 games in the period.
+- Friends: `GET /api/friends`, `POST /api/friends/request {username}`, `POST /api/friends/respond {userId, accept}`, `DELETE /api/friends/<id>`.
+- Invites: `POST /api/invites {friendId, roomCode, boardSize}`, `POST /api/invites/<id>/respond {accept}`, `GET /api/notifications` (polled by clients). Optional Bark push if the user saved a Bark key; APNs hook is a TODO in `createInvite`.

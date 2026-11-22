@@ -1,3 +1,7 @@
+import { Accounts, CORS_HEADERS as ACCOUNT_CORS_HEADERS } from "./accounts.js";
+
+export { Accounts };
+
 const MAX_PLAYERS = 8;
 const PROTOCOL_VERSION = 2;
 const PLAYER_TYPES = {
@@ -84,6 +88,10 @@ async function createAPNsJWT(env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/")) {
+      if (!env.ACCOUNTS) return Response.json({ error: "账号服务未部署" }, { status: 503, headers: ACCOUNT_CORS_HEADERS });
+      return env.ACCOUNTS.get(env.ACCOUNTS.idFromName("global")).fetch(request);
+    }
     if (url.pathname === "/health") {
       return Response.json({ service: "Color War WebSocket", protocolVersion: PROTOCOL_VERSION });
     }
