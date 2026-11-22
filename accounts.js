@@ -269,6 +269,8 @@ export class Accounts {
     if (path === "/api/friends" && method === "GET") return this.listFriends(me);
     if (path === "/api/friends/request" && method === "POST") return this.requestFriend(me, await this.body(request));
     if (path === "/api/friends/respond" && method === "POST") return this.respondFriend(me, await this.body(request));
+    const friendMatches = path.match(/^\/api\/friends\/([A-Za-z0-9-]+)\/matches$/);
+    if (friendMatches && method === "GET") return this.friendMatches(me, friendMatches[1]);
     const friendDelete = path.match(/^\/api\/friends\/([A-Za-z0-9-]+)$/);
     if (friendDelete && method === "DELETE") return this.removeFriend(me, friendDelete[1]);
     if (path === "/api/invites" && method === "POST") return this.createInvite(me, await this.body(request));
@@ -374,6 +376,25 @@ export class Accounts {
         id: r.id, playedAt: r.played_at, mode: r.mode, players: r.players, boardSize: r.board_size, aiKey: r.ai_key,
         aiLabel: r.ai_label, moves: r.moves, myMoves: r.my_moves, result: r.result, duration: r.duration,
         detail: r.detail ? JSON.parse(r.detail) : null,
+      })),
+    });
+  }
+
+  // 好友近一个月战绩：只有已互为好友才能看（不含复盘细节）
+  friendMatches(me, otherId) {
+    const f = this.friendship(me.id, otherId);
+    if (!f || f.status !== "accepted") throw new HttpError(403, "只能查看好友的战绩");
+    const user = this.one(`SELECT * FROM users WHERE id = ?`, otherId);
+    if (!user) throw new HttpError(404, "找不到这个用户");
+    const since = Date.now() - 30 * 24 * 3600 * 1000;
+    const rows = this.q(`SELECT * FROM matches WHERE user_id = ? AND played_at >= ? ORDER BY played_at DESC LIMIT 200`, otherId, since);
+    const stats = { games: rows.length, wins: 0, losses: 0 };
+    for (const r of rows) { if (r.result === "win") stats.wins++; else if (r.result === "loss") stats.losses++; }
+    return json({
+      user: this.publicUser(user), since, stats,
+      matches: rows.map((r) => ({
+        id: r.id, playedAt: r.played_at, mode: r.mode, players: r.players, boardSize: r.board_size, aiKey: r.ai_key,
+        aiLabel: r.ai_label, moves: r.moves, myMoves: r.my_moves, result: r.result, duration: r.duration, detail: null,
       })),
     });
   }
