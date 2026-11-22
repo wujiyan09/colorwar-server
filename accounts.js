@@ -387,16 +387,26 @@ export class Accounts {
       WHERE mode = 'vsAI' AND players = 2 AND ai_key IS NOT NULL AND played_at >= ? GROUP BY ai_key ORDER BY ai_key`, start);
     const aiKey = url.searchParams.get("aiKey") || levels[0]?.aiKey || null;
     let entries = [];
+    let boardSizes = [];
+    let boardSize = null;
     if (aiKey) {
-      const rows = this.q(`SELECT m.user_id AS userId, u.username AS username, u.avatar AS avatar, COUNT(*) AS games,
-          SUM(m.result = 'win') AS wins, SUM(m.result = 'loss') AS losses, SUM(m.moves) AS totalMoves, MAX(m.moves) AS bestMoves
-        FROM matches m JOIN users u ON u.id = m.user_id
-        WHERE m.mode = 'vsAI' AND m.players = 2 AND m.ai_key = ? AND m.played_at >= ? GROUP BY m.user_id`, aiKey, start);
-      entries = rankLeaderboard(rows, limit);
+      boardSizes = this.q(`SELECT board_size AS boardSize, COUNT(*) AS games FROM matches
+        WHERE mode = 'vsAI' AND players = 2 AND ai_key = ? AND board_size IS NOT NULL AND played_at >= ?
+        GROUP BY board_size ORDER BY board_size`, aiKey, start);
+      const asked = Number(url.searchParams.get("boardSize"));
+      if (Number.isInteger(asked) && asked > 0) boardSize = asked;
+      else if (boardSizes.length) boardSize = boardSizes.reduce((a, b) => (b.games > a.games ? b : a)).boardSize;
+      if (boardSize !== null) {
+        const rows = this.q(`SELECT m.user_id AS userId, u.username AS username, u.avatar AS avatar, COUNT(*) AS games,
+            SUM(m.result = 'win') AS wins, SUM(m.result = 'loss') AS losses, SUM(m.moves) AS totalMoves, MAX(m.moves) AS bestMoves
+          FROM matches m JOIN users u ON u.id = m.user_id
+          WHERE m.mode = 'vsAI' AND m.players = 2 AND m.ai_key = ? AND m.board_size = ? AND m.played_at >= ? GROUP BY m.user_id`, aiKey, boardSize, start);
+        entries = rankLeaderboard(rows, limit);
+      }
     }
     return json({
-      period, periodStart: start, aiKey, levels, entries,
-      rule: `仅统计 1 人对 1 个 AI 的双人对局，按 AI 难度分榜；先比胜场，再比平均每局步数（坚持越久越靠前）；本期至少 ${LEADERBOARD_RULE.minGames} 局才上榜`,
+      period, periodStart: start, aiKey, levels, boardSize, boardSizes, entries,
+      rule: `仅统计 1 人对 1 个 AI 的双人对局，按 AI 难度和棋盘大小分榜；先比胜场，再比平均每局步数（坚持越久越靠前）；本期至少 ${LEADERBOARD_RULE.minGames} 局才上榜`,
     });
   }
 
