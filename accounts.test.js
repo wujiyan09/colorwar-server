@@ -75,11 +75,16 @@ test("register, login, profile, matches, leaderboard, friends, invites", async (
   r = await call(acc, "GET", "/api/leaderboard?period=week&limit=5");
   assert.equal(r.data.entries[0].username, "SamW");
   assert.equal(r.data.entries[0].avgMoves, 32);
+  assert.equal(r.data.boardSize, 6);
+  r = await call(acc, "GET", "/api/leaderboard?period=week&limit=5&aiKey=bot3-s4&boardSize=8");
+  assert.equal(r.data.entries.length, 0);
 
   r = await call(acc, "POST", "/api/register", { username: "Tom", password: "secret1", confirmPassword: "secret1" });
   const tom = r.data.token;
   const tomId = r.data.user.id;
   r = await call(acc, "POST", "/api/invites", { friendId: tomId, roomCode: "123456" }, sam);
+  assert.equal(r.status, 403);
+  r = await call(acc, "GET", `/api/friends/${tomId}/matches`, null, sam);
   assert.equal(r.status, 403);
   await call(acc, "POST", "/api/friends/request", { username: "tom" }, sam);
   r = await call(acc, "GET", "/api/notifications", null, tom);
@@ -88,6 +93,9 @@ test("register, login, profile, matches, leaderboard, friends, invites", async (
   await call(acc, "POST", "/api/friends/respond", { userId: samId, accept: true }, tom);
   r = await call(acc, "GET", "/api/friends", null, sam);
   assert.equal(r.data.friends[0].username, "Tom");
+  r = await call(acc, "GET", `/api/friends/${samId}/matches`, null, tom);
+  assert.equal(r.data.stats.games, 3);
+  assert.equal(r.data.matches[0].detail, null);
   r = await call(acc, "POST", "/api/invites", { friendId: tomId, roomCode: "123456", boardSize: 6 }, sam);
   assert.equal(r.status, 201);
   r = await call(acc, "GET", "/api/notifications", null, tom);
