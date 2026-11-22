@@ -538,3 +538,234 @@ test("web resume-ticket endpoint supports browser CORS preflight and POST", asyn
   assert.deepEqual(await response.json(), { ticket: "short-lived-ticket" });
   assert.deepEqual(forwarded, [{ id: "123456", method: "POST", body: "host-secret" }]);
 });
+
+// ---------- WebSocket Hibernation simulation ----------
+class HibSocket {
+  constructor() { this.messages = []; this.attachment = null; this.closed = false; }
+  send(value) { if (this.closed) throw new Error("closed"); this.messages.push(JSON.parse(value)); }
+  close() { this.closed = true; }
+  serializeAttachment(v) { this.attachment = structuredClone(v); }
+  deserializeAttachment() { return this.attachment == null ? null : structuredClone(this.attachment); }
+  last(action) { return [...this.messages].reverse().find((m) => !action || m.action === action); }
+}
+
+function hibernationEnv() {
+  const values = new Map();
+  const pending = [];
+  const accepted = [];
+  const state = {
+    alarmAt: null,
+    storage: {
+      async get(k) { return structuredClone(values.get(k)); },
+      async put(k, v) { values.set(k, structuredClone(v)); },
+      async delete(k) { values.delete(k); },
+      async setAlarm(v) { state.alarmAt = v; },
+    },
+    waitUntil(p) { pending.push(p); },
+    acceptWebSocket(ws, tags) { ws.tags = tags; accepted.push(ws); },
+    getWebSockets() { return accepted.filter((ws) => !ws.closed); },
+  };
+  const flush = () => Promise.all(pending.splice(0));
+  return { state, values, flush, accepted };
+}
+
+// Cloudflare-only globals for the fetch() upgrade path.
+globalThis.WebSocketPair = class { constructor() { this[0] = new HibSocket(); this[1] = new HibSocket(); } };
+const RealResponse = globalThis.Response;
+class UpgradeResponse extends RealResponse {
+  constructor(body, init = {}) {
+    if (init.status === 101) { super(null, { status: 200 }); this.webSocket = init.webSocket; this.upgraded = true; return; }
+    super(body, init);
+  }
+  static json(...a) { return RealResponse.json(...a); }
+}
+
+async function connect(room, role, nickname, headers = {}) {
+  globalThis.Response = UpgradeResponse;
+  try {
+    const before = new Set(room.sockets.keys());
+    const res = await room.fetch(new Request(`https://w.example/ws/123456?role=${role}&nickname=${encodeURIComponent(nickname)}`,
+      { headers: { Upgrade: "websocket", ...headers } }));
+    const server = [...room.sockets.keys()].find((s) => !before.has(s));
+    return { res, server };
+  } finally { globalThis.Response = RealResponse; }
+}
+
+const send = (room, ws, obj) => room.webSocketMessage(ws, JSON.stringify({ protocolVersion: 2, sequenceID: 1, ...obj }));
+
+async function startedRoomWithBot(env) {
+  const room = new Room(env.state);
+  await room.ready;
+  const { server: host } = await connect(room, "host", "Host");
+  const { server: guest } = await connect(room, "player", "Guest");
+  await send(room, host, { action: "hostConfig", boardSize: 6, playerNames: ["Host", "Guest", "Bot"], playerTypes: ["真人", "网络玩家", "算法-噩梦", "未加入"] });
+  await send(room, guest, { action: "setAvatar", avatar: "emoji:🐱:#ff0000" });
+  await send(room, host, { action: "startGame", firstPlayerIndex: 1 });
+  await env.flush();
+  return { room, host, guest };
+}
+
+test("hibernation: sockets accepted via acceptWebSocket carry their seat in the attachment", async () => {
+  const env = hibernationEnv();
+  const { host, guest } = await startedRoomWithBot(env);
+  assert.deepEqual(host.attachment, { playerIndex: 0, isHost: true, nickname: "Host" });
+  assert.deepEqual(guest.attachment, { playerIndex: 1, isHost: false, nickname: "Guest" });
+  assert.deepEqual(host.tags, ["host"]);
+});
+
+test("hibernation: a fresh instance rebuilds sockets and room, then the game continues", async () => {
+  const env = hibernationEnv();
+  const { room, host, guest } = await startedRoomWithBot(env);
+  const seqBefore = room.sequence;
+  // Drop the instance (hibernation) and wake a new one from storage + live sockets.
+  const woke = new Room(env.state);
+  await woke.ready;
+  assert.equal(woke.sockets.size, 2);
+  assert.equal(woke.room.started, true);
+  assert.equal(woke.room.currentTurnIndex, 1);
+  assert.equal(woke.room.config.boardSize, 6);
+  assert.equal(woke.room.avatars[1], "emoji:🐱:#ff0000");
+  assert.ok(woke.sequence >= seqBefore);
+  await send(woke, guest, { action: "playerMove", playerIndex: 1, row: 1, col: 1 });
+  const fwd = host.last("playerMove");
+  assert.equal(fwd.playerIndex, 1);
+  assert.ok(fwd.sequenceID > seqBefore, "sequence must keep increasing after wake");
+  assert.equal(woke.room.movePending, true);
+  await env.flush();
+  // movePending survives a second hibernation, so a duplicate move is still rejected.
+  const woke2 = new Room(env.state);
+  await woke2.ready;
+  assert.equal(woke2.room.movePending, true);
+  const count = host.messages.length;
+  await send(woke2, guest, { action: "playerMove", playerIndex: 1, row: 2, col: 2 });
+  assert.equal(host.messages.length, count);
+  // Host snapshot hands turn to the bot seat; host may move the bot.
+  await send(woke2, host, { action: "stateSnapshot", currentTurnIndex: 2, compactBoardSnapshot: [{ r: 1, c: 1, owner: 1, count: 1 }] });
+  assert.equal(guest.last("stateSnapshot").currentTurnIndex, 2);
+  await send(woke2, host, { action: "playerMove", playerIndex: 2, row: 0, col: 0 });
+  assert.equal(guest.last("playerMove").playerIndex, 2);
+});
+
+test("hibernation: rename after wake is kept in the socket attachment", async () => {
+  const env = hibernationEnv();
+  const { guest } = await startedRoomWithBot(env);
+  const woke = new Room(env.state);
+  await woke.ready;
+  await send(woke, guest, { action: "renamePlayer", nickname: "NewName" });
+  assert.equal(guest.attachment.nickname, "NewName");
+  await env.flush();
+  const woke2 = new Room(env.state);
+  await woke2.ready;
+  assert.equal(woke2.sockets.get(guest).nickname, "NewName");
+  assert.equal(woke2.room.players.get(1), "NewName");
+});
+
+test("hibernation: host disconnect while hibernated, then host resumes with token and gets state", async () => {
+  const env = hibernationEnv();
+  const { host, guest } = await startedRoomWithBot(env);
+  const token = host.last("roomJoined").hostResumeToken;
+  assert.ok(token);
+  host.closed = true;
+  const woke = new Room(env.state);
+  await woke.ready;
+  await woke.webSocketClose(host, 1006, "", false);
+  assert.equal(guest.last().action === "hostDisconnected" || guest.messages.some((m) => m.action === "hostDisconnected"), true);
+  await env.flush();
+  // Moves are blocked while host is away.
+  await send(woke, guest, { action: "playerMove", playerIndex: 1, row: 1, col: 1 });
+  assert.equal(guest.last().action, "hostDisconnected");
+  const woke2 = new Room(env.state);
+  await woke2.ready;
+  const intruder = await connect(woke2, "host", "Evil");
+  assert.equal(intruder.res.status, 409);
+  const { res, server: host2 } = await connect(woke2, "host", "Host", { "x-colorwar-host-token": token });
+  assert.equal(res.upgraded, true);
+  assert.equal(host2.last("roomJoined").isHost, true);
+  assert.ok(host2.messages.some((m) => m.action === "startGame"));
+  assert.ok(guest.messages.some((m) => m.action === "hostReconnected"));
+  await send(woke2, guest, { action: "playerMove", playerIndex: 1, row: 1, col: 1 });
+  assert.equal(host2.last("playerMove").playerIndex, 1);
+});
+
+test("hibernation: a guest drops mid-game and rejoins its seat on a woken instance", async () => {
+  const env = hibernationEnv();
+  const { room, host, guest } = await startedRoomWithBot(env);
+  await send(room, host, { action: "stateSnapshot", currentTurnIndex: 0, compactBoardSnapshot: [] });
+  guest.closed = true;
+  await room.webSocketClose(guest, 1006, "", false);
+  assert.equal(room.room.config.playerTypes[1], "算法-噩梦");
+  assert.equal(room.room.avatars[1], undefined);
+  await env.flush();
+  const woke = new Room(env.state);
+  await woke.ready;
+  assert.deepEqual([...woke.rejoinableSeats], [1]);
+  const { res, server: back } = await connect(woke, "player", "Guest");
+  assert.equal(res.upgraded, true);
+  assert.equal(back.last("roomJoined").playerIndex, 1);
+  assert.equal(back.last("roomJoined").roomStarted, true);
+  assert.ok(back.messages.some((m) => m.action === "stateSnapshot"));
+  assert.equal(woke.room.config.playerTypes[1], "网络玩家");
+  // No third seat to take mid-game.
+  const late = await connect(woke, "player", "Late");
+  assert.equal(late.res.status, 409);
+});
+
+test("hibernation: avatar sync reaches everyone and survives wake", async () => {
+  const env = hibernationEnv();
+  const { host, guest } = await startedRoomWithBot(env);
+  const woke = new Room(env.state);
+  await woke.ready;
+  await send(woke, host, { action: "setAvatar", avatar: "data:image/png;base64,AAAA" });
+  const roster = guest.last("roomRoster");
+  assert.equal(roster.playerAvatars[0], "data:image/png;base64,AAAA");
+  assert.equal(roster.playerAvatars[1], "emoji:🐱:#ff0000");
+  assert.equal(roster.playerAvatars[2], null);
+  await env.flush();
+  const woke2 = new Room(env.state);
+  await woke2.ready;
+  assert.equal(woke2.playerAvatars()[0], "data:image/png;base64,AAAA");
+});
+
+test("hibernation: ping still answers with ack after wake", async () => {
+  const env = hibernationEnv();
+  const { guest } = await startedRoomWithBot(env);
+  const woke = new Room(env.state);
+  await woke.ready;
+  await send(woke, guest, { action: "ping" });
+  assert.equal(guest.last().action, "ack");
+});
+
+test("hibernation: the 2h expiry alarm closes the room and clears storage, even on a fresh instance", async () => {
+  const env = hibernationEnv();
+  const { room, host, guest } = await startedRoomWithBot(env);
+  assert.ok(env.state.alarmAt > Date.now() + 119 * 60 * 1000);
+  // Alarm before expiry just re-arms.
+  await room.alarm();
+  assert.ok(room.room);
+  // Force expiry and fire the alarm on a woken instance.
+  const saved = env.values.get("roomState");
+  saved.expiresAt = Date.now() + 50;
+  env.values.set("roomState", saved);
+  const woke = new Room(env.state);
+  await woke.ready;
+  woke.room.expiresAt = Date.now() - 1;
+  await woke.alarm();
+  assert.equal(woke.room, null);
+  assert.equal(env.values.has("roomState"), false);
+  assert.equal(guest.last("roomClosed").action, "roomClosed");
+  assert.equal(host.closed, true);
+});
+
+test("host leaveRoom closes the room for everyone after hibernation", async () => {
+  const env = hibernationEnv();
+  const { host, guest } = await startedRoomWithBot(env);
+  const woke = new Room(env.state);
+  await woke.ready;
+  await send(woke, host, { action: "leaveRoom" });
+  assert.equal(guest.last().action, "roomClosed");
+  assert.equal(woke.room, null);
+  await env.flush();
+  assert.equal(env.values.has("roomState"), false);
+  // Late close events for already-removed sockets are harmless.
+  await woke.webSocketClose(guest, 1000, "", true);
+});

@@ -133,7 +133,45 @@ export class Room {
     this.room = null;
     // During a live match, only seats vacated by a disconnected participant may be reclaimed.
     this.rejoinableSeats = new Set();
+    // Hibernation: after the object wakes up, the in-memory socket map is gone but the
+    // sockets themselves are still connected. Rebuild it from each socket's attachment.
+    for (const ws of this.state.getWebSockets?.() || []) this.adoptSocket(ws);
     this.ready = this.restoreRoom();
+  }
+
+  adoptSocket(ws) {
+    if (this.sockets.has(ws)) return this.sockets.get(ws);
+    let info = null;
+    try { info = ws.deserializeAttachment?.(); } catch {}
+    if (!info || !Number.isInteger(info.playerIndex)) return null;
+    const entry = { playerIndex: info.playerIndex, isHost: Boolean(info.isHost), nickname: String(info.nickname || "玩家") };
+    this.sockets.set(ws, entry);
+    return entry;
+  }
+
+  saveAttachment(ws) {
+    const entry = this.sockets.get(ws);
+    if (!entry) return;
+    try { ws.serializeAttachment?.({ playerIndex: entry.playerIndex, isHost: entry.isHost, nickname: entry.nickname }); } catch {}
+  }
+
+  // WebSocket Hibernation API handlers (the runtime calls these instead of event listeners).
+  async webSocketMessage(ws, message) {
+    await this.ready;
+    this.adoptSocket(ws);
+    this.onMessage(ws, typeof message === "string" ? message : null);
+  }
+
+  async webSocketClose(ws) {
+    await this.ready;
+    this.adoptSocket(ws);
+    this.onClose(ws);
+  }
+
+  async webSocketError(ws) {
+    await this.ready;
+    this.adoptSocket(ws);
+    this.onClose(ws);
   }
 
   async restoreRoom() {
@@ -249,18 +287,22 @@ export class Room {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.accept();
     this.sockets.set(server, { playerIndex, isHost: role === "host", nickname });
+    if (typeof this.state.acceptWebSocket === "function") {
+      this.state.acceptWebSocket(server, [role]);
+      this.saveAttachment(server);
+    } else {
+      server.accept();
+      server.addEventListener("message", (event) => this.onMessage(server, event.data));
+      server.addEventListener("close", () => this.onClose(server));
+      server.addEventListener("error", () => this.onClose(server));
+    }
     this.room.players.set(playerIndex, nickname);
     if (role === "player" || resumedHost) this.rejoinableSeats.delete(playerIndex);
     if (role !== "host" && this.room.config) {
       this.refreshRoomConfigFromParticipants();
       this.broadcastRoomConfig();
     }
-
-    server.addEventListener("message", (event) => this.onMessage(server, event.data));
-    server.addEventListener("close", () => this.onClose(server));
-    server.addEventListener("error", () => this.onClose(server));
 
     this.send(server, packet("roomJoined", this.nextSequence(), {
       roomCode,
@@ -433,6 +475,7 @@ export class Room {
       const nickname = String(message.nickname || "").trim().slice(0, 32);
       if (!nickname) return;
       participant.nickname = nickname;
+      this.saveAttachment(socket);
       this.room.players.set(participant.playerIndex, nickname);
       if (this.room.config && Array.isArray(this.room.config.playerNames)) {
         const names = this.room.config.playerNames.slice(0, MAX_PLAYERS);
@@ -567,6 +610,7 @@ export class Room {
     if (action === "syncRequest") {
       if (participant.isHost) return;
       this.broadcast({ ...message, sequenceID: this.nextSequence() }, socket);
+      this.persistRoom(); // keep the sequence counter durable across hibernation
       return;
     }
 
@@ -574,6 +618,7 @@ export class Room {
       const hostConnected = [...this.sockets.values()].some((entry) => entry.isHost);
       if (!hostConnected) {
         this.send(socket, packet("hostDisconnected", this.nextSequence(), { playerIndex: 0, message: "等待房主恢复后才能继续落子。" }));
+        this.persistRoom();
         return;
       }
       const playerIndex = Number(message.playerIndex);
