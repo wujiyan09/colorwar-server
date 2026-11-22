@@ -8,6 +8,7 @@ const PLAYER_TYPES = {
   human: "真人",
   mathNightmare: "算法-噩梦",
   enhancedNightmare: "算法-噩梦 (加强版)",
+  driveBot: "drive-bot",
   network: "网络玩家",
   disabled: "未加入",
 };
@@ -294,7 +295,8 @@ export class Room {
     return Array.from({ length: MAX_PLAYERS - 1 }, (_, i) => i + 1).find((index) => {
       if (usedSeats.has(index)) return false;
       const configuredType = this.room.config?.playerTypes?.[index];
-      return configuredType !== PLAYER_TYPES.mathNightmare && configuredType !== PLAYER_TYPES.enhancedNightmare;
+      return configuredType !== PLAYER_TYPES.mathNightmare && configuredType !== PLAYER_TYPES.enhancedNightmare
+        && configuredType !== PLAYER_TYPES.driveBot;
     });
   }
 
@@ -315,6 +317,7 @@ export class Room {
         if (index === 0) {
           const hostType = this.room.config?.playerTypes?.[0];
           types[index] = hostType === PLAYER_TYPES.mathNightmare || hostType === PLAYER_TYPES.enhancedNightmare
+            || hostType === PLAYER_TYPES.driveBot
             ? hostType
             : PLAYER_TYPES.human;
         } else {
@@ -447,6 +450,7 @@ export class Room {
           const requestedType = requestedTypes[i];
           if (requestedType === PLAYER_TYPES.mathNightmare
             || requestedType === PLAYER_TYPES.enhancedNightmare
+            || requestedType === PLAYER_TYPES.driveBot
             || requestedType === PLAYER_TYPES.disabled) {
             normalized.playerTypes[i] = requestedType;
           }
@@ -557,7 +561,8 @@ export class Room {
       if (playerIndex !== this.room.currentTurnIndex) return;
       const isOwnSeat = playerIndex === participant.playerIndex;
       const playerType = this.room.config?.playerTypes?.[playerIndex];
-      const isAI = playerType === PLAYER_TYPES.mathNightmare || playerType === PLAYER_TYPES.enhancedNightmare;
+      const isAI = playerType === PLAYER_TYPES.mathNightmare || playerType === PLAYER_TYPES.enhancedNightmare
+        || playerType === PLAYER_TYPES.driveBot;
       if (!isOwnSeat && !(participant.isHost && isAI)) return;
       const boardSize = this.room.config?.boardSize ?? 8;
       if (!Number.isInteger(message.row) || !Number.isInteger(message.col)
