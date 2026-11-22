@@ -119,6 +119,17 @@ test("renamePlayer updates only the connected participant's assigned roster seat
 });
 
 
+test("setAvatar stores a seat avatar and roster carries playerAvatars", () => {
+  const { room, host, guest } = setupRoom();
+  room.onMessage(guest, JSON.stringify({ protocolVersion: 2, action: "setAvatar", sequenceID: 4, avatar: "emoji:🐯:#ff8800" }));
+  assert.equal(host.messages.at(-1).action, "roomRoster");
+  assert.equal(host.messages.at(-1).playerAvatars[1], "emoji:🐯:#ff8800");
+  assert.equal(host.messages.at(-1).playerAvatars[0], null);
+  room.onMessage(guest, JSON.stringify({ protocolVersion: 2, action: "setAvatar", sequenceID: 5, avatar: "javascript:x" }));
+  assert.equal(host.messages.at(-1).playerAvatars[1], null);
+});
+
+
 test("startGame carries the host's canonical board size to guests", () => {
   const { room, host, guest } = setupRoom();
   room.room.config = { protocolVersion: 2, action: "hostConfig", boardSize: 10, playerTypes: ["真人", "网络玩家"] };

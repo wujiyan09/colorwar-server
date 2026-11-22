@@ -333,7 +333,14 @@ export class Room {
       roomCode: this.room?.roomCode,
       playerNames: this.playerNames(),
       playerTypes: this.playerTypes(),
+      playerAvatars: this.playerAvatars(),
     });
+  }
+
+  // 每个座位的账号头像（data:image… 照片或 emoji:… 表情头像），没有就是 null。旧客户端会忽略这个字段。
+  playerAvatars() {
+    const avatars = this.room?.avatars || {};
+    return Array.from({ length: MAX_PLAYERS }, (_, i) => (this.room?.players.has(i) && typeof avatars[i] === "string" ? avatars[i] : null));
   }
 
   broadcastRoster() { this.broadcast(this.rosterPacket()); }
@@ -406,6 +413,19 @@ export class Room {
         this.persistRoom();
         try { socket.close(1000, "left room"); } catch {}
       }
+      return;
+    }
+
+    if (action === "setAvatar") {
+      const avatar = typeof message.avatar === "string" ? message.avatar : "";
+      if (!this.room.avatars) this.room.avatars = {};
+      if (avatar && avatar.length <= 48_000 && (avatar.startsWith("data:image/") || avatar.startsWith("emoji:"))) {
+        this.room.avatars[participant.playerIndex] = avatar;
+      } else {
+        delete this.room.avatars[participant.playerIndex];
+      }
+      this.broadcastRoster();
+      this.persistRoom();
       return;
     }
 
@@ -651,6 +671,7 @@ export class Room {
 
     if (this.room.started) this.rejoinableSeats.add(participant.playerIndex);
     else this.rejoinableSeats.delete(participant.playerIndex);
+    if (this.room.avatars) delete this.room.avatars[participant.playerIndex];
 
     if (this.room.config) {
       const playerTypes = this.playerTypes();
