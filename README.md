@@ -47,6 +47,6 @@ All account data lives in a SQLite-backed Durable Object (`Accounts`, binding `A
 - Passwords are currently stored as plain text on purpose. Replace `hashPassword` / `verifyPassword` in `accounts.js` to add hashing.
 - `GET/PATCH /api/me {username?, avatar?, barkKey?}`; avatar is `emoji:<emoji>:#RRGGBB` or a small `data:image/jpeg;base64,...`.
 - `POST /api/matches {matches:[...]}` (idempotent by client id), `GET /api/matches?limit=&before=`.
-- `GET /api/leaderboard?period=week|month|season|year&aiKey=&limit=5|100`. Rule lives in `LEADERBOARD_RULE`: only 1 human vs 1 AI 2-player games, one board per AI difficulty, wins desc then average moves per game desc, at least 3 games in the period.
+- `GET /api/leaderboard?period=week|month|season|year&aiKey=&limit=5|100`. Rule lives in `LEADERBOARD_RULE`: only 1 human vs 1 AI 2-player games, one board per AI difficulty and board size (`boardSize=`, defaults to the most-played size; response has `boardSizes`), wins desc then average moves per game desc, at least 3 games in the period.
 - Friends: `GET /api/friends`, `POST /api/friends/request {username}`, `POST /api/friends/respond {userId, accept}`, `DELETE /api/friends/<id>`.
 - Invites: `POST /api/invites {friendId, roomCode, boardSize}`, `POST /api/invites/<id>/respond {accept}`, `GET /api/notifications` (polled by clients). Optional Bark push if the user saved a Bark key; APNs hook is a TODO in `createInvite`.
