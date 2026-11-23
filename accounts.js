@@ -181,6 +181,9 @@ export class Accounts {
     for (const col of ["verify TEXT", "verify_reason TEXT", "uploaded_at INTEGER"]) {
       try { this.sql.exec(`ALTER TABLE matches ADD COLUMN ${col}`); } catch { /* already there */ }
     }
+    // 0d3fbbb (live ~12:23–12:32 on 2026-11-23) wrongly marked every upload without a move list 'unverified';
+    // that status no longer exists, so put those rows back on the leaderboard
+    this.sql.exec(`UPDATE matches SET verify = 'ok', verify_reason = '恢复：早期版本误标未核对' WHERE verify = 'unverified'`);
     // finished online games as recorded and replayed by the room server (source of truth for online uploads)
     this.sql.exec(`CREATE TABLE IF NOT EXISTS online_games (id INTEGER PRIMARY KEY AUTOINCREMENT, ended_at INTEGER NOT NULL,
       board_size INTEGER, players INTEGER, names TEXT, record TEXT)`);
