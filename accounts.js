@@ -2,6 +2,9 @@
 // Everything lives in one SQLite-backed Durable Object ("global"), so no D1 database or
 // dashboard setup is needed; the Worker deploys it with the existing Workers Builds hook.
 
+import { handleAdmin } from "./admin.js";
+import { verifyUpload, COUNTED_SQL } from "./verify.js";
+
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 export const CORS_HEADERS = {
   "access-control-allow-origin": "*",
@@ -10,6 +13,7 @@ export const CORS_HEADERS = {
   "access-control-max-age": "600",
 };
 
+export const ADMIN_ORIGINS = ["https://wujiyan09.ct.ws", "http://wujiyan09.ct.ws"];
 const DAY = 24 * 60 * 60 * 1000;
 const HK_OFFSET = 8 * 60 * 60 * 1000;
 const SESSION_TTL = 180 * DAY;
@@ -173,6 +177,10 @@ export class Accounts {
       `CREATE TABLE IF NOT EXISTS login_failures (key TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at INTEGER NOT NULL)`,
     ];
     for (const s of statements) this.sql.exec(s);
+    // anti-cheat columns (added 2026-11-23); old rows keep verify = NULL and still count
+    for (const col of ["verify TEXT", "verify_reason TEXT", "move_list TEXT", "uploaded_at INTEGER", "seats TEXT"]) {
+      try { this.sql.exec(`ALTER TABLE matches ADD COLUMN ${col}`); } catch { /* already there */ }
+    }
   }
 
   publicUser(row) {
@@ -229,6 +237,17 @@ export class Accounts {
   }
 
   async fetch(request) {
+    const res = await this.handle(request);
+    if (!new URL(request.url).pathname.startsWith("/api/admin")) return res;
+    // 管理接口只允许 Sam 的管理页面跨域调用
+    const origin = request.headers.get("origin") || "";
+    const headers = new Headers(res.headers);
+    if (ADMIN_ORIGINS.includes(origin)) { headers.set("access-control-allow-origin", origin); headers.set("vary", "Origin"); }
+    else headers.delete("access-control-allow-origin");
+    return new Response(res.body, { status: res.status, headers });
+  }
+
+  async handle(request) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
     try {
       return await this.route(request);
@@ -254,6 +273,7 @@ export class Accounts {
     if (path === "/api/register" && method === "POST") return this.register(await this.body(request));
     if (path === "/api/login" && method === "POST") return this.login(request, await this.body(request));
     if (path === "/api/leaderboard" && method === "GET") return this.leaderboard(url);
+    if (path === "/api/admin" || path.startsWith("/api/admin/")) return handleAdmin(this, request, url, path, method, { HttpError, json });
 
     const auth = this.authenticate(request);
     const me = auth.user;
@@ -266,7 +286,7 @@ export class Accounts {
     if (path === "/api/me" && method === "PATCH") return this.updateMe(me, await this.body(request));
     if (path === "/api/me/delete" && method === "POST") return this.deleteAccount(me, await this.body(request));
     if (path === "/api/me/password" && method === "POST") return this.setPassword(me, await this.body(request), auth.token);
-    if (path === "/api/matches" && method === "POST") return this.addMatches(me, await this.body(request));
+    if (path === "/api/matches" && method === "POST") return await this.addMatches(me, await this.body(request));
     if (path === "/api/matches" && method === "GET") return this.listMatches(me, url);
     if (path === "/api/friends" && method === "GET") return this.listFriends(me);
     if (path === "/api/friends/request" && method === "POST") return this.requestFriend(me, await this.body(request));
@@ -364,6 +384,12 @@ export class Accounts {
   // 注销账号：要求密码确认；删除本人所有数据，并把别人战绩里出现的名字匿名化
   async deleteAccount(me, body) {
     if (me.pw_hash && !(await verifyPassword(String(body.password || ""), me.pw_hash, me.pw_salt))) throw new HttpError(403, "密码不正确");
+    this.purgeUser(me);
+    return json({ ok: true });
+  }
+
+  // 删除一个用户的全部数据（注销账号和管理后台共用）
+  purgeUser(me) {
     const id = me.id, name = me.username;
     this.sql.exec(`DELETE FROM matches WHERE user_id = ?`, id);
     const others = this.q(`SELECT user_id, id, detail FROM matches WHERE detail LIKE ?`, `%${name}%`);
@@ -383,10 +409,21 @@ export class Accounts {
     this.sql.exec(`DELETE FROM bark_keys WHERE user_id = ?`, id);
     this.sql.exec(`DELETE FROM login_failures WHERE key = ?`, `user:${me.username_key || name.toLowerCase()}`);
     this.sql.exec(`DELETE FROM users WHERE id = ?`, id);
-    return json({ ok: true });
   }
 
-  addMatches(me, body) {
+  // 联机对局：向房间要服务器记录的棋步（房间还在的话），作为可信来源
+  async roomMoveLog(raw) {
+    const code = typeof raw?.roomCode === "string" && /^[0-9]{6}$/.test(raw.roomCode) ? raw.roomCode : null;
+    if (!code || !this.env?.ROOMS || !Array.isArray(raw.moveList)) return null;
+    try {
+      const res = await this.env.ROOMS.get(this.env.ROOMS.idFromName(code)).fetch(`https://room.internal/internal/game-logs/${code}`);
+      if (!res.ok) return null;
+      const { logs } = await res.json();
+      return (logs || []).map((l) => l.moves).filter((l) => Array.isArray(l) && l.length);
+    } catch { return null; }
+  }
+
+  async addMatches(me, body) {
     const list = Array.isArray(body?.matches) ? body.matches : [body];
     let added = 0;
     for (const raw of list.slice(0, 200)) {
@@ -394,9 +431,15 @@ export class Accounts {
       if (!m) continue;
       const before = this.one(`SELECT 1 AS x FROM matches WHERE user_id = ? AND id = ?`, me.id, m.id);
       if (before) continue;
-      this.sql.exec(`INSERT INTO matches (user_id, id, played_at, mode, players, board_size, ai_key, ai_label, moves, my_moves, result, duration, detail)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        me.id, m.id, m.playedAt, m.mode, m.players, m.boardSize, m.aiKey, m.aiLabel, m.moves, m.myMoves, m.result, m.duration, m.detail);
+      const recentUploads = this.one(`SELECT COUNT(*) AS n FROM matches WHERE user_id = ? AND uploaded_at >= ?`, me.id, Date.now() - 10 * 60 * 1000)?.n || 0;
+      const trusted = m.mode === "online" ? await this.roomMoveLog(raw) : null;
+      const v = verifyUpload(m, raw, { trusted, recentUploads });
+      this.sql.exec(`INSERT INTO matches (user_id, id, played_at, mode, players, board_size, ai_key, ai_label, moves, my_moves, result, duration, detail,
+          verify, verify_reason, move_list, uploaded_at, seats)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        me.id, m.id, m.playedAt, m.mode, m.players, m.boardSize, m.aiKey, m.aiLabel, m.moves, m.myMoves, m.result, m.duration, m.detail,
+        v.verify, v.reason, v.moveList ? JSON.stringify(v.moveList).slice(0, 60000) : null, Date.now(),
+        Array.isArray(raw.seats) ? JSON.stringify({ seats: raw.seats, mySeat: raw.mySeat ?? null, start: raw.start ?? null }).slice(0, 200) : null);
       added++;
     }
     return json({ added });
@@ -440,14 +483,14 @@ export class Accounts {
     if (start === null) throw new HttpError(400, "period 只能是 week/month/all（旧版 season/year 仍可用）");
     const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 100));
     const levels = this.q(`SELECT ai_key AS aiKey, MAX(ai_label) AS aiLabel, COUNT(*) AS games FROM matches
-      WHERE mode = 'vsAI' AND players = 2 AND ai_key IS NOT NULL AND played_at >= ? GROUP BY ai_key ORDER BY ai_key`, start);
+      WHERE mode = 'vsAI' AND players = 2 AND ai_key IS NOT NULL AND played_at >= ? AND ${COUNTED_SQL} GROUP BY ai_key ORDER BY ai_key`, start);
     const aiKey = url.searchParams.get("aiKey") || levels[0]?.aiKey || null;
     let entries = [];
     let boardSizes = [];
     let boardSize = null;
     if (aiKey) {
       boardSizes = this.q(`SELECT board_size AS boardSize, COUNT(*) AS games FROM matches
-        WHERE mode = 'vsAI' AND players = 2 AND ai_key = ? AND board_size IS NOT NULL AND played_at >= ?
+        WHERE mode = 'vsAI' AND players = 2 AND ai_key = ? AND board_size IS NOT NULL AND played_at >= ? AND ${COUNTED_SQL}
         GROUP BY board_size ORDER BY board_size`, aiKey, start);
       const asked = Number(url.searchParams.get("boardSize"));
       if (Number.isInteger(asked) && asked > 0) boardSize = asked;
@@ -456,7 +499,7 @@ export class Accounts {
         const rows = this.q(`SELECT m.user_id AS userId, u.username AS username, u.avatar AS avatar, COUNT(*) AS games,
             SUM(m.result = 'win') AS wins, SUM(m.result = 'loss') AS losses, SUM(m.moves) AS totalMoves, MAX(m.moves) AS bestMoves
           FROM matches m JOIN users u ON u.id = m.user_id
-          WHERE m.mode = 'vsAI' AND m.players = 2 AND m.ai_key = ? AND m.board_size = ? AND m.played_at >= ? GROUP BY m.user_id`, aiKey, boardSize, start);
+          WHERE m.mode = 'vsAI' AND m.players = 2 AND m.ai_key = ? AND m.board_size = ? AND m.played_at >= ? AND ${COUNTED_SQL} GROUP BY m.user_id`, aiKey, boardSize, start);
         entries = rankLeaderboard(rows, limit);
       }
     }

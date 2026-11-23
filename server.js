@@ -236,6 +236,13 @@ export class Room {
   async fetch(request) {
     await this.ready;
     const url = new URL(request.url);
+    // Internal only (the Worker never forwards /internal/*): the Accounts object reads the
+    // server-recorded move lists of this room's recent games to verify online match uploads.
+    const logMatch = url.pathname.match(/^\/internal\/game-logs\/([0-9]{6})$/);
+    if (logMatch) {
+      if (!this.room || this.room.roomCode !== logMatch[1]) return Response.json({ logs: [] }, { status: 404 });
+      return Response.json({ logs: this.room.gameLogs || [] });
+    }
     const resumeMatch = url.pathname.match(/^\/resume-ticket\/([0-9]{6})\/?$/);
     if (resumeMatch && request.method === "POST") {
       if (Number(request.headers.get("content-length") || 0) > 256) return new Response("Invalid resume token", { status: 400 });
@@ -551,6 +558,8 @@ export class Room {
       this.room.started = true;
       this.room.movePending = false;
       this.room.snapshot = null;
+      // server-side move record for anti-cheat (last 5 games of this room)
+      this.room.gameLogs = [...(this.room.gameLogs || []), { startedAt: Date.now(), moves: [] }].slice(-5);
       this.room.currentTurnIndex = firstPlayerIndex;
       const configuredBoardSize = this.room.config?.boardSize;
       this.room.startPacket = {
@@ -637,6 +646,8 @@ export class Room {
       if (!Number.isInteger(message.row) || !Number.isInteger(message.col)
         || message.row < 0 || message.row >= boardSize || message.col < 0 || message.col >= boardSize) return;
       this.room.movePending = true;
+      const logs = this.room.gameLogs;
+      if (logs?.length && logs[logs.length - 1].moves.length < 5000) logs[logs.length - 1].moves.push([message.row, message.col, playerIndex]);
       this.broadcast({ ...message, playerIndex, sequenceID: this.nextSequence() }, socket);
       this.persistRoom();
       return;
