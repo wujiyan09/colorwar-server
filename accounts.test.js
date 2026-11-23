@@ -36,6 +36,7 @@ test("validators and periods", () => {
   assert.equal(validateUsername("Sam 王"), null);
   const now = Date.UTC(2026, 10, 22, 12); // Sun 22 Nov 2026 20:00 HK
   assert.equal(new Date(periodStart("week", now) + 8 * 3600e3).toISOString().slice(0, 10), "2026-11-16");
+  assert.equal(periodStart("all", now), 0);
   assert.equal(new Date(periodStart("season", now) + 8 * 3600e3).toISOString().slice(0, 10), "2026-10-01");
   assert.equal(normalizeMatch({ id: "x" }), null);
 });

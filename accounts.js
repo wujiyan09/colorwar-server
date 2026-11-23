@@ -51,6 +51,7 @@ export function validateAvatar(avatar) {
 
 /** Start of the current week (Monday), month, quarter ("season") or year in Hong Kong time. */
 export function periodStart(period, now = Date.now()) {
+  if (period === "all") return 0; // 总榜：全部时间
   const hk = new Date(now + HK_OFFSET);
   const y = hk.getUTCFullYear();
   const m = hk.getUTCMonth();
@@ -428,7 +429,7 @@ export class Accounts {
   leaderboard(url) {
     const period = url.searchParams.get("period") || "week";
     const start = periodStart(period);
-    if (start === null) throw new HttpError(400, "period 只能是 week/month/season/year");
+    if (start === null) throw new HttpError(400, "period 只能是 week/month/all（旧版 season/year 仍可用）");
     const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 100));
     const levels = this.q(`SELECT ai_key AS aiKey, MAX(ai_label) AS aiLabel, COUNT(*) AS games FROM matches
       WHERE mode = 'vsAI' AND players = 2 AND ai_key IS NOT NULL AND played_at >= ? GROUP BY ai_key ORDER BY ai_key`, start);
