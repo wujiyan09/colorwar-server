@@ -1,11 +1,11 @@
-// Anti-cheat: replay an uploaded match with the exact game rules (ported from the iOS/web clients'
-// resolveMove / updateEliminationStatus / checkGameOver / advanceToNextTurn; client engines untouched)
-// and check board size, legality, turn order, winner, step counts and the claimed result.
+// Anti-cheat (server only; clients unchanged).
+// replayGame: the game rules ported from the iOS/web clients (resolveMove / elimination / game over / next turn).
+//   The Room server uses it to replay the moves it relayed in an online game and records the true result.
+// checkUpload: sanity checks for every uploaded match + cross-check of online uploads against the room record.
 //
 // Status stored on each match row (column `verify`):
 //   NULL        historical rows from before this existed — counted as before
 //   "ok"        replay matches the claim — counted
-//   "unverified" new upload from an old client with no move list — kept, NOT on the leaderboard
 //   "flagged"   replay / sanity check failed — kept, NOT on the leaderboard, reason in `verify_reason`
 //   "approved"  an admin approved it — counted
 
@@ -92,39 +92,63 @@ export function replayGame({ boardSize, seats, start, moveList }) {
   return { ok: true, winner, moves: moveList.length, perPlayer };
 }
 
+// ---- upload checks (server-only: clients are unchanged, they send the same match record as before) ----
+export const LIMITS = {
+  perTenMinutes: 30,        // uploads per user per 10 minutes
+  perDay: 300,              // uploads per user per 24 hours
+  minMsPerMove: 150,        // fastest a move can resolve in either client
+  maxFutureMs: 5 * 60 * 1000,
+  maxAgeMs: 400 * 24 * 3600 * 1000,
+  streakWins: 40,           // consecutive vs-AI wins (strong AIs, 强度 ≥ 3)
+  dailyWinsStrong: 80,      // vs-AI wins against 强度 ≥ 3 within 24h
+};
+const strongAI = (aiKey) => /^bot3-s([3-9])$/.test(aiKey || "") || /^bot[12]-l([4-9])$/.test(aiKey || "");
+
 /**
- * Checks an uploaded match (normalized `m` + the raw upload) and returns { verify, reason, moveList }.
- * `trusted` (optional) is the list of server-recorded move lists of the room's recent games (online).
+ * m: normalized upload. ctx: { now, recentTen, recentDay, prior (rows of this user's last ~60 vs-AI uploads, newest first),
+ *   strongWinsDay, onlineRecord (server room record or null) }.
+ * Returns { verify: "ok"|"flagged", reason }.
  */
-export function verifyUpload(m, raw, { trusted = null, recentUploads = 0 } = {}) {
-  const flag = (reason) => ({ verify: "flagged", reason, moveList: Array.isArray(raw?.moveList) ? raw.moveList : null });
-  if (recentUploads >= 40) return flag("上传太频繁（10 分钟内超过 40 局）");
-  if (!Array.isArray(raw?.moveList)) return { verify: "unverified", reason: "旧版客户端，没有上传棋步", moveList: null };
-  let moveList = raw.moveList;
-  const seats = raw.seats;
-  const start = raw.start === "duel" ? "duel" : "empty";
-  let source = null;
-  if (Array.isArray(trusted) && trusted.length) {
-    // trusted = move lists the room server recorded (recent games). Prefer the exact same game;
-    // otherwise the latest finished game in that room. The server record wins over the client's list.
-    const key = (l) => l.map((x) => x.join(",")).join(";");
-    const exact = trusted.find((l) => key(l) === key(moveList));
-    const finished = [...trusted].reverse().find((l) => replayGame({ boardSize: m.boardSize, seats, start, moveList: l }).ok);
-    const pick = exact || finished;
-    if (pick) { moveList = pick; source = exact ? "联机：服务器记录" : "联机：服务器记录（客户端棋步不一致，已按服务器记录核对）"; }
+export function checkUpload(m, raw, ctx) {
+  const now = ctx.now ?? Date.now();
+  const flag = (reason) => ({ verify: "flagged", reason });
+  const n = m.boardSize, cells = n * n;
+  if ((ctx.recentTen ?? 0) >= LIMITS.perTenMinutes) return flag(`上传太频繁（10 分钟内超过 ${LIMITS.perTenMinutes} 局）`);
+  if ((ctx.recentDay ?? 0) >= LIMITS.perDay) return flag(`超过每日上限（24 小时内超过 ${LIMITS.perDay} 局）`);
+  if (m.playedAt > now + LIMITS.maxFutureMs) return flag("对局时间在未来");
+  if (m.playedAt < now - LIMITS.maxAgeMs) return flag("对局时间太早");
+  if (!Number.isInteger(n) || n < 3 || n > 20) return flag("棋盘大小不正确");
+  if (m.players < 2 || m.players > 8) return flag("人数不正确");
+  if (m.mode === "vsAI" && m.players !== 2) return flag("人机对局必须是两人");
+  // 最少步数：赢家要把对手全部吃掉，至少需要让格子爆开；放宽到人数 × 2
+  const minMoves = Math.max(m.players * 2, 4);
+  if (m.result !== "none" && m.moves < minMoves) return flag(`步数太少（${m.moves} 步不可能结束 ${n}×${n} 的对局）`);
+  if (m.moves > cells * 40) return flag(`步数太多（${n}×${n} 棋盘 ${m.moves} 步）`);
+  if (m.myMoves > m.moves) return flag("我的步数大于总步数");
+  // 两人对局严格轮流，所以我的步数 ≈ 总步数的一半
+  if (m.mode !== "local" && m.players === 2 && Math.abs(m.myMoves * 2 - m.moves) > 2) return flag(`我的步数和总步数对不上（两人轮流，${m.moves} 步里我走了 ${m.myMoves} 步）`);
+  if (m.duration * 1000 < m.moves * LIMITS.minMsPerMove) return flag(`用时太短（${m.moves} 步只用了 ${m.duration} 秒）`);
+  if (m.duration > 6 * 3600) return flag("用时超过 6 小时");
+  const prior = ctx.prior || [];
+  const overlap = (p) => Math.min(p.played_at + (p.duration || 0) * 1000, m.playedAt + m.duration * 1000) - Math.max(p.played_at, m.playedAt);
+  if (prior.some((p) => p.mode !== "local" && m.mode !== "local" && overlap(p) > 10000))
+    return flag("和另一局时间重叠（同一时间不可能下两局）");
+  if (m.mode === "vsAI" && m.result === "win" && strongAI(m.aiKey)) {
+    let streak = 1;
+    for (const p of prior) { if (p.mode !== "vsAI" || !strongAI(p.ai_key)) continue; if (p.result === "win") streak++; else break; }
+    if (streak > LIMITS.streakWins) return flag(`连胜异常（对强 AI 连赢 ${streak} 局）`);
+    if ((ctx.strongWinsDay ?? 0) + 1 > LIMITS.dailyWinsStrong) return flag(`胜场异常（24 小时内赢强 AI 超过 ${LIMITS.dailyWinsStrong} 局）`);
   }
-  if (m.mode === "online" && start === "duel") return flag("联机对局不能用对弈开局");
-  const res = replayGame({ boardSize: m.boardSize, seats, start, moveList });
-  if (!res.ok) return flag(res.reason);
-  if (seats.length !== m.players) return flag(`人数不一致（声称 ${m.players}，棋步里 ${seats.length}）`);
-  if (res.moves !== m.moves) return flag(`步数不一致（声称 ${m.moves}，实际 ${res.moves}）`);
-  const mySeat = Number.isInteger(raw.mySeat) ? raw.mySeat : null;
-  if (mySeat !== null && !seats.includes(mySeat)) return flag("我的座位不在这局里");
-  if (m.mode === "vsAI" && (mySeat === null || seats.length !== 2)) return flag("人机对局必须是一人对一个 AI");
-  const expected = mySeat === null || res.winner === null ? "none" : res.winner === mySeat ? "win" : "loss";
-  if (m.result !== expected) return flag(`结果不一致（声称 ${m.result}，实际 ${expected}）`);
-  const myMoves = mySeat === null ? 0 : res.perPlayer[mySeat] || 0;
-  if (m.myMoves !== myMoves) return flag(`我的步数不一致（声称 ${m.myMoves}，实际 ${myMoves}）`);
-  if (m.duration * 1000 < m.moves * MIN_MS_PER_MOVE) return flag(`用时太短（${m.moves} 步只用了 ${m.duration} 秒）`);
-  return { verify: "ok", reason: source, moveList };
+  if (m.mode === "online") {
+    const rec = ctx.onlineRecord;
+    if (!rec) return { verify: "ok", reason: "联机：没有找到服务器记录（只做了基本检查）" };
+    if (rec.moves !== m.moves) return flag(`和服务器联机记录不一致：步数 ${m.moves}，服务器记录 ${rec.moves}`);
+    if (!rec.perPlayer.includes(m.myMoves)) return flag(`和服务器联机记录不一致：我的步数 ${m.myMoves}`);
+    const claimedWinner = raw?.detail?.winnerName ?? null;
+    if (claimedWinner !== null && rec.winnerName !== null && claimedWinner !== rec.winnerName) return flag(`和服务器联机记录不一致：胜者应是 ${rec.winnerName}`);
+    const winnerMoves = rec.winnerSeatMoves;
+    if (m.result === "win" && rec.winnerName !== null && m.myMoves !== winnerMoves) return flag("和服务器联机记录不一致：你不是这局的胜者");
+    return { verify: "ok", reason: "联机：和服务器记录一致" };
+  }
+  return { verify: "ok", reason: null };
 }

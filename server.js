@@ -1,3 +1,4 @@
+import { replayGame } from "./verify.js";
 import { Accounts, CORS_HEADERS as ACCOUNT_CORS_HEADERS } from "./accounts.js";
 
 export { Accounts };
@@ -84,6 +85,25 @@ async function createAPNsJWT(env) {
   );
   const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(signingInput));
   return `${signingInput}.${base64url(new Uint8Array(signature))}`;
+}
+
+export function onlineGameRecord(config, log) {
+  const types = config?.playerTypes || [];
+  const names = config?.playerNames || [];
+  const seats = types.map((t, i) => (t !== undefined && t !== null && t !== PLAYER_TYPES.disabled ? i : -1)).filter((i) => i >= 0);
+  const boardSize = config?.boardSize ?? 8;
+  for (const start of ["empty", "duel"]) {
+    const res = replayGame({ boardSize, seats, start, moveList: log.moves });
+    if (!res.ok) continue;
+    return {
+      endedAt: Date.now(), startedAt: log.startedAt, boardSize, players: seats.length,
+      names: seats.map((i) => String(names[i] ?? "")), moves: res.moves,
+      perPlayer: seats.map((i) => res.perPlayer[i] || 0),
+      winnerName: res.winner === null ? null : String(names[res.winner] ?? ""),
+      winnerSeatMoves: res.winner === null ? null : res.perPlayer[res.winner] || 0,
+    };
+  }
+  return null;
 }
 
 export default {
@@ -236,13 +256,6 @@ export class Room {
   async fetch(request) {
     await this.ready;
     const url = new URL(request.url);
-    // Internal only (the Worker never forwards /internal/*): the Accounts object reads the
-    // server-recorded move lists of this room's recent games to verify online match uploads.
-    const logMatch = url.pathname.match(/^\/internal\/game-logs\/([0-9]{6})$/);
-    if (logMatch) {
-      if (!this.room || this.room.roomCode !== logMatch[1]) return Response.json({ logs: [] }, { status: 404 });
-      return Response.json({ logs: this.room.gameLogs || [] });
-    }
     const resumeMatch = url.pathname.match(/^\/resume-ticket\/([0-9]{6})\/?$/);
     if (resumeMatch && request.method === "POST") {
       if (Number(request.headers.get("content-length") || 0) > 256) return new Response("Invalid resume token", { status: 400 });
@@ -559,7 +572,7 @@ export class Room {
       this.room.movePending = false;
       this.room.snapshot = null;
       // server-side move record for anti-cheat (last 5 games of this room)
-      this.room.gameLogs = [...(this.room.gameLogs || []), { startedAt: Date.now(), moves: [] }].slice(-5);
+      this.room.gameLogs = [...(this.room.gameLogs || []), { startedAt: Date.now(), moves: [], reported: false }].slice(-5);
       this.room.currentTurnIndex = firstPlayerIndex;
       const configuredBoardSize = this.room.config?.boardSize;
       this.room.startPacket = {
@@ -650,8 +663,24 @@ export class Room {
       if (logs?.length && logs[logs.length - 1].moves.length < 5000) logs[logs.length - 1].moves.push([message.row, message.col, playerIndex]);
       this.broadcast({ ...message, playerIndex, sequenceID: this.nextSequence() }, socket);
       this.persistRoom();
+      void this.reportFinishedGame();
       return;
     }
+  }
+
+  // 防作弊：房间自己按规则复盘服务器收到的棋步；对局结束时把结果（人数、名字、步数、胜者）交给账号服务，
+  // 用来核对玩家之后上传的联机战绩。
+  async reportFinishedGame() {
+    const log = this.room?.gameLogs?.at(-1);
+    if (!log || log.reported || !this.env?.ACCOUNTS) return;
+    const record = onlineGameRecord(this.room.config, log);
+    if (!record) return;
+    log.reported = true;
+    this.persistRoom();
+    try {
+      await this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName("global"))
+        .fetch("https://accounts.internal/internal/online-game", { method: "POST", body: JSON.stringify(record) });
+    } catch (error) { console.error("online game report failed", error); }
   }
 
   async pushLiveActivityUpdates(previousTurnIndex = null) {

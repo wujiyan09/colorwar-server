@@ -71,8 +71,8 @@ test("register, login, profile, matches, leaderboard, friends, invites", async (
   const matches = [1, 2, 3].map((i) => ({ id: `match-000${i}`, playedAt: now - i, mode: "vsAI", players: 2, boardSize: 6, aiKey: "bot3-s4", aiLabel: "Bot 3 · 强度 4", moves: 30 + i, result: "loss" }));
   r = await call(acc, "POST", "/api/matches", { matches: [...matches, matches[0]] }, sam);
   assert.equal(r.data.added, 3);
-  // these uploads have no move list (old client) → unverified, off the leaderboard; treat them as historical rows here
-  assert.equal(acc.one(`SELECT COUNT(*) AS n FROM matches WHERE verify = 'unverified'`).n, 3);
+  // these test uploads aren't realistic (0 s, myMoves 0) → flagged by the sanity checks; treat them as historical rows here
+  assert.equal(acc.one(`SELECT COUNT(*) AS n FROM matches WHERE verify = 'flagged'`).n, 3);
   acc.sql.exec(`UPDATE matches SET verify = NULL`);
   r = await call(acc, "GET", "/api/matches?limit=2", null, sam);
   assert.equal(r.data.matches.length, 2);

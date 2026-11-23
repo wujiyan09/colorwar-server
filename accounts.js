@@ -3,7 +3,7 @@
 // dashboard setup is needed; the Worker deploys it with the existing Workers Builds hook.
 
 import { handleAdmin } from "./admin.js";
-import { verifyUpload, COUNTED_SQL } from "./verify.js";
+import { checkUpload, COUNTED_SQL } from "./verify.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 export const CORS_HEADERS = {
@@ -178,9 +178,13 @@ export class Accounts {
     ];
     for (const s of statements) this.sql.exec(s);
     // anti-cheat columns (added 2026-11-23); old rows keep verify = NULL and still count
-    for (const col of ["verify TEXT", "verify_reason TEXT", "move_list TEXT", "uploaded_at INTEGER", "seats TEXT"]) {
+    for (const col of ["verify TEXT", "verify_reason TEXT", "uploaded_at INTEGER"]) {
       try { this.sql.exec(`ALTER TABLE matches ADD COLUMN ${col}`); } catch { /* already there */ }
     }
+    // finished online games as recorded and replayed by the room server (source of truth for online uploads)
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS online_games (id INTEGER PRIMARY KEY AUTOINCREMENT, ended_at INTEGER NOT NULL,
+      board_size INTEGER, players INTEGER, names TEXT, record TEXT)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS online_games_ended ON online_games (ended_at)`);
   }
 
   publicUser(row) {
@@ -268,6 +272,7 @@ export class Accounts {
     const path = url.pathname.replace(/\/+$/, "");
     const method = request.method;
 
+    if (path === "/internal/online-game" && method === "POST") return this.saveOnlineGame(await this.body(request));
     if (path === "/api/config" && method === "GET") return json({ leaderboardMinGames: LEADERBOARD_RULE.minGames });
 
     if (path === "/api/register" && method === "POST") return this.register(await this.body(request));
@@ -411,16 +416,22 @@ export class Accounts {
     this.sql.exec(`DELETE FROM users WHERE id = ?`, id);
   }
 
-  // 联机对局：向房间要服务器记录的棋步（房间还在的话），作为可信来源
-  async roomMoveLog(raw) {
-    const code = typeof raw?.roomCode === "string" && /^[0-9]{6}$/.test(raw.roomCode) ? raw.roomCode : null;
-    if (!code || !this.env?.ROOMS || !Array.isArray(raw.moveList)) return null;
-    try {
-      const res = await this.env.ROOMS.get(this.env.ROOMS.idFromName(code)).fetch(`https://room.internal/internal/game-logs/${code}`);
-      if (!res.ok) return null;
-      const { logs } = await res.json();
-      return (logs || []).map((l) => l.moves).filter((l) => Array.isArray(l) && l.length);
-    } catch { return null; }
+  // 房间服务器在联机对局结束时报告的结果（只从 Durable Object 内部调用，Worker 不转发 /internal/*）
+  saveOnlineGame(rec) {
+    if (!rec || !Number.isInteger(rec.boardSize) || !Array.isArray(rec.names)) throw new HttpError(400, "bad record");
+    this.sql.exec(`INSERT INTO online_games (ended_at, board_size, players, names, record) VALUES (?, ?, ?, ?, ?)`,
+      Number(rec.endedAt) || Date.now(), rec.boardSize, rec.players, JSON.stringify([...rec.names].sort()), JSON.stringify(rec).slice(0, 4000));
+    this.sql.exec(`DELETE FROM online_games WHERE ended_at < ?`, Date.now() - 3 * DAY);
+    return json({ ok: true });
+  }
+
+  findOnlineGame(m, raw) {
+    const names = Array.isArray(raw?.detail?.names) ? JSON.stringify(raw.detail.names.map(String).sort()) : null;
+    if (!names) return null;
+    const rows = this.q(`SELECT record FROM online_games WHERE board_size = ? AND players = ? AND names = ? AND ended_at >= ? AND ended_at <= ?
+      ORDER BY ended_at DESC LIMIT 5`, m.boardSize, m.players, names, m.playedAt - 60000, m.playedAt + m.duration * 1000 + 15 * 60000);
+    const recs = rows.map((r) => JSON.parse(r.record));
+    return recs.find((r) => r.moves === m.moves) || recs[0] || null;
   }
 
   async addMatches(me, body) {
@@ -431,15 +442,23 @@ export class Accounts {
       if (!m) continue;
       const before = this.one(`SELECT 1 AS x FROM matches WHERE user_id = ? AND id = ?`, me.id, m.id);
       if (before) continue;
-      const recentUploads = this.one(`SELECT COUNT(*) AS n FROM matches WHERE user_id = ? AND uploaded_at >= ?`, me.id, Date.now() - 10 * 60 * 1000)?.n || 0;
-      const trusted = m.mode === "online" ? await this.roomMoveLog(raw) : null;
-      const v = verifyUpload(m, raw, { trusted, recentUploads });
+      const now = Date.now();
+      const count = (sql, ...a) => this.one(sql, ...a)?.n || 0;
+      const v = checkUpload(m, raw, {
+        now,
+        recentTen: count(`SELECT COUNT(*) AS n FROM matches WHERE user_id = ? AND uploaded_at >= ?`, me.id, now - 10 * 60 * 1000),
+        recentDay: count(`SELECT COUNT(*) AS n FROM matches WHERE user_id = ? AND uploaded_at >= ?`, me.id, now - DAY),
+        prior: this.q(`SELECT played_at, duration, mode, ai_key, result FROM matches WHERE user_id = ? AND played_at < ? AND played_at > ?
+          ORDER BY played_at DESC LIMIT 60`, me.id, m.playedAt + m.duration * 1000 + 1, m.playedAt - 30 * DAY),
+        strongWinsDay: count(`SELECT COUNT(*) AS n FROM matches WHERE user_id = ? AND mode = 'vsAI' AND result = 'win' AND played_at >= ?
+          AND (ai_key GLOB 'bot3-s[3-9]' OR ai_key GLOB 'bot[12]-l[4-9]')`, me.id, m.playedAt - DAY),
+        onlineRecord: m.mode === "online" ? this.findOnlineGame(m, raw) : null,
+      });
       this.sql.exec(`INSERT INTO matches (user_id, id, played_at, mode, players, board_size, ai_key, ai_label, moves, my_moves, result, duration, detail,
-          verify, verify_reason, move_list, uploaded_at, seats)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          verify, verify_reason, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         me.id, m.id, m.playedAt, m.mode, m.players, m.boardSize, m.aiKey, m.aiLabel, m.moves, m.myMoves, m.result, m.duration, m.detail,
-        v.verify, v.reason, v.moveList ? JSON.stringify(v.moveList).slice(0, 60000) : null, Date.now(),
-        Array.isArray(raw.seats) ? JSON.stringify({ seats: raw.seats, mySeat: raw.mySeat ?? null, start: raw.start ?? null }).slice(0, 200) : null);
+        v.verify, v.reason, now);
       added++;
     }
     return json({ added });

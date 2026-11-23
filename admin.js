@@ -49,7 +49,6 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     userId: r.user_id, username: r.username ?? null, id: r.id, playedAt: r.played_at, mode: r.mode, players: r.players,
     boardSize: r.board_size, aiKey: r.ai_key, aiLabel: r.ai_label, moves: r.moves, myMoves: r.my_moves, result: r.result,
     duration: r.duration, verify: r.verify ?? null, verifyReason: r.verify_reason ?? null,
-    moveList: r.move_list ? (() => { try { return JSON.parse(r.move_list); } catch { return null; } })() : null,
     detail: r.detail ? (() => { try { return JSON.parse(r.detail); } catch { return r.detail; } })() : null,
   });
 
