@@ -133,6 +133,7 @@ export class Room {
     this.room = null;
     // During a live match, only seats vacated by a disconnected participant may be reclaimed.
     this.rejoinableSeats = new Set();
+    this.closedSockets = new WeakSet();
     // Hibernation: after the object wakes up, the in-memory socket map is gone but the
     // sockets themselves are still connected. Rebuild it from each socket's attachment.
     for (const ws of this.state.getWebSockets?.() || []) this.adoptSocket(ws);
@@ -141,9 +142,12 @@ export class Room {
 
   adoptSocket(ws) {
     if (this.sockets.has(ws)) return this.sockets.get(ws);
+    // A socket already handled by onClose must never come back: hibernation can deliver both
+    // webSocketError and webSocketClose (or a late close after the player rejoined on a new socket).
+    if (this.closedSockets.has(ws)) return null;
     let info = null;
     try { info = ws.deserializeAttachment?.(); } catch {}
-    if (!info || !Number.isInteger(info.playerIndex)) return null;
+    if (!info || info.closed || !Number.isInteger(info.playerIndex)) return null;
     const entry = { playerIndex: info.playerIndex, isHost: Boolean(info.isHost), nickname: String(info.nickname || "玩家") };
     this.sockets.set(ws, entry);
     return entry;
@@ -687,9 +691,14 @@ export class Room {
 
   onClose(socket) {
     const participant = this.sockets.get(socket);
+    this.closedSockets.add(socket);
+    try { socket.serializeAttachment?.({ closed: true }); } catch {}
     if (!participant) return;
     this.sockets.delete(socket);
     if (!this.room) return;
+    // A stale socket closing after its player already reconnected on a new socket must not
+    // free that seat or turn it into a bot.
+    if ([...this.sockets.values()].some((entry) => entry.playerIndex === participant.playerIndex)) return;
     this.room.players.delete(participant.playerIndex);
 
     if (participant.isHost) {

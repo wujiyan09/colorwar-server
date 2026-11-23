@@ -769,3 +769,46 @@ test("host leaveRoom closes the room for everyone after hibernation", async () =
   // Late close events for already-removed sockets are harmless.
   await woke.webSocketClose(guest, 1000, "", true);
 });
+
+test("regression: error + close for one socket is handled once (no phantom bot / duplicate playerLeft)", async () => {
+  const env = hibernationEnv();
+  const { room, host, guest } = await startedRoomWithBot(env);
+  guest.closed = true;
+  await room.webSocketError(guest, new Error("reset"));
+  const leftCount = host.messages.filter((m) => m.action === "playerLeft").length;
+  // Guest rejoins its seat on a new socket.
+  const { server: back } = await connect(room, "player", "Guest");
+  assert.equal(back.last("roomJoined").playerIndex, 1);
+  // Late close event for the old socket, also on a freshly woken instance.
+  await room.webSocketClose(guest, 1006, "", false);
+  await env.flush();
+  const woke = new Room(env.state); await woke.ready;
+  await woke.webSocketClose(guest, 1006, "", false);
+  assert.equal(host.messages.filter((m) => m.action === "playerLeft").length, leftCount);
+  assert.equal(woke.room.config.playerTypes[1], "网络玩家");
+  assert.equal(woke.room.players.get(1), "Guest");
+  assert.equal(woke.sockets.size, 2);
+});
+
+test("regression: 2-player lobby has no bot seat and stays that way across wake and a guest reconnect", async () => {
+  const env = hibernationEnv();
+  const room = new Room(env.state); await room.ready;
+  const { server: host } = await connect(room, "host", "H");
+  await send(room, host, { action: "hostConfig", boardSize: 6, playerNames: ["H", "", "", ""], playerTypes: ["真人", "网络玩家", "未加入", "未加入", "未加入", "未加入", "未加入", "未加入"] });
+  const { server: guest } = await connect(room, "player", "G");
+  const bots = (types) => types.filter((t) => t === "算法-噩梦" || t === "算法-噩梦 (加强版)" || t === "drive-bot").length;
+  assert.equal(bots(room.playerTypes()), 0);
+  guest.closed = true;
+  await room.webSocketError(guest);
+  await connect(room, "player", "G");
+  await room.webSocketClose(guest, 1006, "", false);
+  await env.flush();
+  const woke = new Room(env.state); await woke.ready;
+  assert.equal(bots(woke.playerTypes()), 0);
+  assert.deepEqual(woke.playerTypes().slice(0, 3), ["真人", "网络玩家", "未加入"]);
+  // Host can still add and remove a bot in the lobby.
+  await send(woke, host, { action: "hostConfig", playerTypes: ["真人", "网络玩家", "drive-bot", "未加入", "未加入", "未加入", "未加入", "未加入"] });
+  assert.equal(bots(woke.playerTypes()), 1);
+  await send(woke, host, { action: "hostConfig", playerTypes: ["真人", "网络玩家", "未加入", "未加入", "未加入", "未加入", "未加入", "未加入"] });
+  assert.equal(bots(woke.playerTypes()), 0);
+});
