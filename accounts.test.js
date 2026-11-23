@@ -123,3 +123,25 @@ test("delete account removes user data and requires password", async () => {
   r = await call(acc, "POST", "/api/login", { username: "Del", password: "secret1" });
   assert.equal(r.status, 401);
 });
+
+test("change password: verifies old, same rules, keeps current session, ends others, rate limited", async () => {
+  const acc = await makeAccounts();
+  let r = await call(acc, "POST", "/api/register", { username: "Pw", password: "secret1", confirmPassword: "secret1" });
+  const current = r.data.token;
+  const other = (await call(acc, "POST", "/api/login", { username: "pw", password: "secret1" })).data.token;
+  r = await call(acc, "POST", "/api/me/password", { oldPassword: "wrong1", password: "newpass1", confirmPassword: "newpass1" }, current);
+  assert.equal(r.status, 403);
+  r = await call(acc, "POST", "/api/me/password", { oldPassword: "secret1", password: "123", confirmPassword: "123" }, current);
+  assert.equal(r.status, 400);
+  r = await call(acc, "POST", "/api/me/password", { oldPassword: "secret1", password: "newpass1", confirmPassword: "newpass2" }, current);
+  assert.equal(r.status, 400);
+  r = await call(acc, "POST", "/api/me/password", { oldPassword: "secret1", password: "newpass1", confirmPassword: "newpass1" }, current);
+  assert.equal(r.status, 200);
+  assert.equal((await call(acc, "GET", "/api/me", null, current)).status, 200);
+  assert.equal((await call(acc, "GET", "/api/me", null, other)).status, 401);
+  assert.equal((await call(acc, "POST", "/api/login", { username: "pw", password: "secret1" })).status, 401);
+  assert.equal((await call(acc, "POST", "/api/login", { username: "pw", password: "newpass1" })).status, 200);
+  for (let i = 0; i < 8; i++) await call(acc, "POST", "/api/me/password", { oldPassword: "bad", password: "zzzzzz1", confirmPassword: "zzzzzz1" }, current);
+  r = await call(acc, "POST", "/api/me/password", { oldPassword: "newpass1", password: "zzzzzz1", confirmPassword: "zzzzzz1" }, current);
+  assert.equal(r.status, 429);
+});

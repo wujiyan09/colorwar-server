@@ -265,7 +265,7 @@ export class Accounts {
     if (path === "/api/me" && method === "GET") return json({ user: this.privateUser(me) });
     if (path === "/api/me" && method === "PATCH") return this.updateMe(me, await this.body(request));
     if (path === "/api/me/delete" && method === "POST") return this.deleteAccount(me, await this.body(request));
-    if (path === "/api/me/password" && method === "POST") return this.setPassword(me, await this.body(request));
+    if (path === "/api/me/password" && method === "POST") return this.setPassword(me, await this.body(request), auth.token);
     if (path === "/api/matches" && method === "POST") return this.addMatches(me, await this.body(request));
     if (path === "/api/matches" && method === "GET") return this.listMatches(me, url);
     if (path === "/api/friends" && method === "GET") return this.listFriends(me);
@@ -341,15 +341,23 @@ export class Accounts {
     return json({ user: this.privateUser(this.one(`SELECT * FROM users WHERE id = ?`, me.id)) });
   }
 
-  async setPassword(me, body) {
+  // 修改密码：验证原密码（和登录共用失败次数限制），规则同注册；成功后让其他设备的登录失效，只保留当前这台
+  async setPassword(me, body, currentToken = null) {
     const pwError = validatePassword(body.password);
     if (pwError) throw new HttpError(400, pwError);
     if (body.confirmPassword !== body.password) throw new HttpError(400, "两次输入的密码不一致");
+    const limitKey = `user:${me.username_key || String(me.username || "").toLowerCase()}`;
     if (me.pw_hash) {
-      if (!(await verifyPassword(String(body.oldPassword || ""), me.pw_hash, me.pw_salt))) throw new HttpError(403, "原密码不正确");
+      this.checkRateLimit(limitKey);
+      if (!(await verifyPassword(String(body.oldPassword || ""), me.pw_hash, me.pw_salt))) {
+        this.recordFailure(limitKey);
+        throw new HttpError(403, "原密码不正确");
+      }
     }
     const { hash, salt } = await hashPassword(body.password);
     this.sql.exec(`UPDATE users SET pw_hash = ?, pw_salt = ? WHERE id = ?`, hash, salt, me.id);
+    this.sql.exec(`DELETE FROM login_failures WHERE key = ?`, limitKey);
+    if (currentToken) this.sql.exec(`DELETE FROM sessions WHERE user_id = ? AND token != ?`, me.id, currentToken);
     return json({ ok: true });
   }
 
