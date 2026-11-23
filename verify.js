@@ -9,7 +9,6 @@
 //   "flagged"   replay / sanity check failed — kept, NOT on the leaderboard, reason in `verify_reason`
 //   "approved"  an admin approved it — counted
 
-export const COUNTED_SQL = "(verify IS NULL OR verify IN ('ok', 'approved'))";
 const MAX_PLAYERS = 8;
 const MIN_MS_PER_MOVE = 150; // the fastest a move can resolve in either client (AI waits 150 ms + animation)
 

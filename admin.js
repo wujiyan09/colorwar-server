@@ -49,6 +49,7 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     userId: r.user_id, username: r.username ?? null, id: r.id, playedAt: r.played_at, mode: r.mode, players: r.players,
     boardSize: r.board_size, aiKey: r.ai_key, aiLabel: r.ai_label, moves: r.moves, myMoves: r.my_moves, result: r.result,
     duration: r.duration, verify: r.verify ?? null, verifyReason: r.verify_reason ?? null,
+    restored: !!r.restored, similar: r.sim_status ?? null, similarReason: r.sim_reason ?? null,
     detail: r.detail ? (() => { try { return JSON.parse(r.detail); } catch { return r.detail; } })() : null,
   });
 
@@ -95,6 +96,8 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     if (username) { where.push("u.username_key = ?"); args.push(username.trim().toLowerCase()); }
     const verify = url.searchParams.get("verify");
     if (verify === "historical") where.push("m.verify IS NULL");
+    else if (verify === "similar") where.push("m.sim_status = 'dup'");
+    else if (verify === "restored") where.push("m.restored = 1");
     else if (verify) { where.push("m.verify = ?"); args.push(verify); }
     if (url.searchParams.get("aiKey")) { where.push("m.ai_key = ?"); args.push(url.searchParams.get("aiKey")); }
     if (url.searchParams.get("from")) { where.push("m.played_at >= ?"); args.push(Number(url.searchParams.get("from")) || 0); }
@@ -144,6 +147,10 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
       if (!["ok", "approved", "flagged", "unverified"].includes(b.verify)) throw new HttpError(400, "verify 只能是 ok/approved/flagged/unverified");
       acc.sql.exec(`UPDATE matches SET verify = ?, verify_reason = ? WHERE user_id = ? AND id = ?`,
         b.verify, b.verify === "approved" ? `管理员批准（原因：${row.verify_reason || "无"}）`.slice(0, 300) : row.verify_reason, userId, id);
+    }
+    if (b.similar !== undefined) {
+      if (b.similar !== "approved") throw new HttpError(400, "similar 只能是 approved");
+      acc.sql.exec(`UPDATE matches SET sim_status = 'approved' WHERE user_id = ? AND id = ?`, userId, id);
     }
     log("match.edit", `${userId}/${id}`, { before: cur, changes: b });
     return json({ match: matchOut(acc.one(`SELECT * FROM matches WHERE user_id = ? AND id = ?`, userId, id)) });

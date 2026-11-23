@@ -3,7 +3,8 @@
 // dashboard setup is needed; the Worker deploys it with the existing Workers Builds hook.
 
 import { handleAdmin } from "./admin.js";
-import { checkUpload, COUNTED_SQL } from "./verify.js";
+import { checkUpload } from "./verify.js";
+import { SIMILARITY, countedSql, encodeMoves, cleanBoard, compareGames } from "./similarity.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 export const CORS_HEADERS = {
@@ -178,7 +179,8 @@ export class Accounts {
     ];
     for (const s of statements) this.sql.exec(s);
     // anti-cheat columns (added 2026-11-23); old rows keep verify = NULL and still count
-    for (const col of ["verify TEXT", "verify_reason TEXT", "uploaded_at INTEGER"]) {
+    for (const col of ["verify TEXT", "verify_reason TEXT", "uploaded_at INTEGER",
+      "restored INTEGER", "sim_moves TEXT", "sim_board TEXT", "sim_status TEXT", "sim_reason TEXT"]) {
       try { this.sql.exec(`ALTER TABLE matches ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     // 0d3fbbb (live ~12:23–12:32 on 2026-11-23) wrongly marked every upload without a move list 'unverified';
@@ -437,6 +439,35 @@ export class Accounts {
     return recs.find((r) => r.moves === m.moves) || recs[0] || null;
   }
 
+  // 防刷：和自己 7 天内同 AI、同棋盘的其他胜局比较；只保留最早的一局在榜（SIMILARITY_ENFORCE=true 时才真正排除）
+  checkSimilarity(me, m, raw, now) {
+    // prune stored move lists: older than the window (+1 day) or beyond the per-user cap
+    this.sql.exec(`UPDATE matches SET sim_moves = NULL, sim_board = NULL WHERE user_id = ? AND sim_moves IS NOT NULL AND played_at < ?`,
+      me.id, now - (SIMILARITY.windowDays + 1) * DAY);
+    const moves = m.mode === "vsAI" && m.result === "win" && raw?.restored !== true ? encodeMoves(raw?.moveList) : null;
+    if (!moves || moves.length / 3 < SIMILARITY.minMoves) return;
+    const board = cleanBoard(raw?.finalBoard);
+    this.sql.exec(`UPDATE matches SET sim_moves = ?, sim_board = ? WHERE user_id = ? AND id = ?`, moves, board, me.id, m.id);
+    const keep = this.q(`SELECT id FROM matches WHERE user_id = ? AND sim_moves IS NOT NULL ORDER BY played_at DESC LIMIT -1 OFFSET ?`, me.id, SIMILARITY.maxStoredPerUser);
+    for (const k of keep) this.sql.exec(`UPDATE matches SET sim_moves = NULL, sim_board = NULL WHERE user_id = ? AND id = ?`, me.id, k.id);
+    const win = SIMILARITY.windowDays * DAY;
+    const others = this.q(`SELECT id, played_at, sim_moves, sim_board, sim_status FROM matches WHERE user_id = ? AND id <> ? AND mode = 'vsAI'
+      AND result = 'win' AND ai_key IS ? AND board_size = ? AND sim_moves IS NOT NULL AND played_at BETWEEN ? AND ? ORDER BY played_at`,
+      me.id, m.id, m.aiKey, m.boardSize, m.playedAt - win, m.playedAt + win);
+    const mine = { moves, board };
+    let flaggedSelf = false;
+    for (const o of others) {
+      const c = compareGames(mine, { moves: o.sim_moves, board: o.sim_board });
+      if (!c.dup) continue;
+      const [later, earlier] = o.played_at <= m.playedAt ? [m.id, o.id] : [o.id, m.id];
+      if (later === m.id && flaggedSelf) continue;
+      if (later !== m.id && o.sim_status) continue; // already flagged or approved
+      this.sql.exec(`UPDATE matches SET sim_status = 'dup', sim_reason = ? WHERE user_id = ? AND id = ? AND COALESCE(sim_status, '') <> 'approved'`,
+        `与对局 ${earlier} 相似度 ${c.percent}%（${c.rule}）`, me.id, later);
+      if (later === m.id) flaggedSelf = true;
+    }
+  }
+
   async addMatches(me, body) {
     const list = Array.isArray(body?.matches) ? body.matches : [body];
     let added = 0;
@@ -458,10 +489,11 @@ export class Accounts {
         onlineRecord: m.mode === "online" ? this.findOnlineGame(m, raw) : null,
       });
       this.sql.exec(`INSERT INTO matches (user_id, id, played_at, mode, players, board_size, ai_key, ai_label, moves, my_moves, result, duration, detail,
-          verify, verify_reason, uploaded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          verify, verify_reason, uploaded_at, restored)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         me.id, m.id, m.playedAt, m.mode, m.players, m.boardSize, m.aiKey, m.aiLabel, m.moves, m.myMoves, m.result, m.duration, m.detail,
-        v.verify, v.reason, now);
+        v.verify, v.reason, now, raw?.restored === true ? 1 : 0);
+      this.checkSimilarity(me, m, raw, now);
       added++;
     }
     return json({ added });
@@ -505,14 +537,14 @@ export class Accounts {
     if (start === null) throw new HttpError(400, "period 只能是 week/month/all（旧版 season/year 仍可用）");
     const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 100));
     const levels = this.q(`SELECT ai_key AS aiKey, MAX(ai_label) AS aiLabel, COUNT(*) AS games FROM matches
-      WHERE mode = 'vsAI' AND players = 2 AND ai_key IS NOT NULL AND played_at >= ? AND ${COUNTED_SQL} GROUP BY ai_key ORDER BY ai_key`, start);
+      WHERE mode = 'vsAI' AND players = 2 AND ai_key IS NOT NULL AND played_at >= ? AND ${countedSql(this.env)} GROUP BY ai_key ORDER BY ai_key`, start);
     const aiKey = url.searchParams.get("aiKey") || levels[0]?.aiKey || null;
     let entries = [];
     let boardSizes = [];
     let boardSize = null;
     if (aiKey) {
       boardSizes = this.q(`SELECT board_size AS boardSize, COUNT(*) AS games FROM matches
-        WHERE mode = 'vsAI' AND players = 2 AND ai_key = ? AND board_size IS NOT NULL AND played_at >= ? AND ${COUNTED_SQL}
+        WHERE mode = 'vsAI' AND players = 2 AND ai_key = ? AND board_size IS NOT NULL AND played_at >= ? AND ${countedSql(this.env)}
         GROUP BY board_size ORDER BY board_size`, aiKey, start);
       const asked = Number(url.searchParams.get("boardSize"));
       if (Number.isInteger(asked) && asked > 0) boardSize = asked;
@@ -521,7 +553,7 @@ export class Accounts {
         const rows = this.q(`SELECT m.user_id AS userId, u.username AS username, u.avatar AS avatar, COUNT(*) AS games,
             SUM(m.result = 'win') AS wins, SUM(m.result = 'loss') AS losses, SUM(m.moves) AS totalMoves, MAX(m.moves) AS bestMoves
           FROM matches m JOIN users u ON u.id = m.user_id
-          WHERE m.mode = 'vsAI' AND m.players = 2 AND m.ai_key = ? AND m.board_size = ? AND m.played_at >= ? AND ${COUNTED_SQL} GROUP BY m.user_id`, aiKey, boardSize, start);
+          WHERE m.mode = 'vsAI' AND m.players = 2 AND m.ai_key = ? AND m.board_size = ? AND m.played_at >= ? AND ${countedSql(this.env)} GROUP BY m.user_id`, aiKey, boardSize, start);
         entries = rankLeaderboard(rows, limit);
       }
     }
