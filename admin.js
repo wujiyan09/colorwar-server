@@ -206,6 +206,7 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
   }
 
   // ---- one-off relabel (2026-11-24): old duel Bot 3 records "Bot 3 · 强度 N" / "Bot 3 · 入门" -> "Bot 0 · <难度名>".
+  // Only 6/9/12 boards (the only sizes the duel tab ever allowed; other sizes are party games).
   // Only ai_label changes; ai_key, scores, verify etc. untouched. Party records saved as plain "Bot 3" are not matched.
   // POST { dryRun: true } -> counts + rows; POST { dryRun: false } -> backs up rows to relabel_backup, then updates.
   // Optional { before: <ms timestamp> } limits to records played before that time.
@@ -215,7 +216,7 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     const before = Number.isFinite(Number(b?.before)) && Number(b?.before) > 0 ? Number(b.before) : null;
     const TIERS = ["入门", "简单", "中等", "困难", "困难+"];
     const rows = acc.q(`SELECT user_id, id, played_at, ai_key, ai_label FROM matches
-      WHERE mode = 'vsAI' AND players = 2 AND ai_key LIKE 'bot3-s%' AND (ai_label LIKE 'Bot 3 · 强度 %' OR ai_label = 'Bot 3 · 入门')
+      WHERE mode = 'vsAI' AND players = 2 AND board_size IN (6, 9, 12) AND ai_key LIKE 'bot3-s%' AND (ai_label LIKE 'Bot 3 · 强度 %' OR ai_label = 'Bot 3 · 入门')
       ${before ? "AND played_at < ?" : ""} ORDER BY played_at`, ...(before ? [before] : []));
     const plan = [];
     for (const r of rows) {

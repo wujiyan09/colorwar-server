@@ -107,6 +107,7 @@ test("relabel-bot0: dry run, apply with backup, undo; party 'Bot 3' and aiKey un
   await mk("relabel-0002", "Bot 3 · 入门", "bot3-s0");
   await mk("relabel-0003", "Bot 3", "bot3-s4");
   await mk("relabel-0004", "Bot 2 · 2档", "bot2-l2");
+  await call(acc, "POST", "/api/admin/matches", { userId: uid, id: "relabel-0005", mode: "vsAI", players: 2, boardSize: 5, aiKey: "bot3-s2", aiLabel: "Bot 3 · 强度 2", moves: 40, result: "win" }, ADMIN);
   let r = (await call(acc, "POST", "/api/admin/relabel-bot0", { dryRun: true }, ADMIN)).data;
   assert.equal(r.count, 2);
   assert.deepEqual(r.rows.map(x => x.to).sort(), ["Bot 0 · 入门", "Bot 0 · 困难+"]);
