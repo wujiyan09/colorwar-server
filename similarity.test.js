@@ -57,8 +57,8 @@ test("compareGames rules", () => {
   assert.equal(compareGames({ moves: enc(a) }, { moves: enc(d) }).dup, false);
 });
 
-test("observe-only (default): restore-farm wins are flagged but still ranked; restored uploads never ranked", async () => {
-  const { acc, up, row, lb } = await setup({});
+test("observe-only (SIMILARITY_ENFORCE=false): restore-farm wins are flagged but still ranked; restored uploads never ranked", async () => {
+  const { acc, up, row, lb } = await setup({ SIMILARITY_ENFORCE: "false" });
   const finish = randomMoves(15, 42);
   await up("farm-0001", [...randomMoves(20, 10), ...finish]);
   await up("farm-0002", [...randomMoves(18, 11), ...finish]);
@@ -105,4 +105,12 @@ test("move lists are pruned after the window", async () => {
   assert.ok(row("old-game01").sim_moves);
   await up("new-game01", randomMoves(40, 2));
   assert.equal(row("old-game01").sim_moves, null);
+});
+
+test("enforcement is on by default; only 'false' turns it off", async () => {
+  const { similarityEnforced } = await import("./similarity.js");
+  assert.equal(similarityEnforced({}), true);
+  assert.equal(similarityEnforced(undefined), true);
+  assert.equal(similarityEnforced({ SIMILARITY_ENFORCE: "true" }), true);
+  assert.equal(similarityEnforced({ SIMILARITY_ENFORCE: "FALSE" }), false);
 });

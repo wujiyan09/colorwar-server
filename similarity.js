@@ -10,8 +10,8 @@ export const SIMILARITY = {
   maxMoves: 4000,
 };
 
-/** true unless the Worker variable SIMILARITY_ENFORCE is "true" (observe-only by default). */
-export const similarityEnforced = (env) => String(env?.SIMILARITY_ENFORCE ?? "").toLowerCase() === "true";
+/** Enforced by default (2026-11-24); only SIMILARITY_ENFORCE = "false" switches back to observe-only. */
+export const similarityEnforced = (env) => String(env?.SIMILARITY_ENFORCE ?? "").toLowerCase() !== "false";
 
 /** Leaderboard filter. Restored games never count; similarity duplicates only when enforcing. */
 export function countedSql(env) {

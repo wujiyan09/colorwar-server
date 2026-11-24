@@ -439,7 +439,7 @@ export class Accounts {
     return recs.find((r) => r.moves === m.moves) || recs[0] || null;
   }
 
-  // 防刷：和自己 7 天内同 AI、同棋盘的其他胜局比较；只保留最早的一局在榜（SIMILARITY_ENFORCE=true 时才真正排除）
+  // 防刷：和自己 7 天内同 AI、同棋盘的其他胜局比较；只保留最早的一局在榜（默认排除；SIMILARITY_ENFORCE=false 时只观察）
   checkSimilarity(me, m, raw, now) {
     // prune stored move lists: older than the window (+1 day) or beyond the per-user cap
     this.sql.exec(`UPDATE matches SET sim_moves = NULL, sim_board = NULL WHERE user_id = ? AND sim_moves IS NOT NULL AND played_at < ?`,

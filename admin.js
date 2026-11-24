@@ -205,6 +205,49 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     return json({ ok: true, deleted: rows.length });
   }
 
+  // ---- one-off relabel (2026-11-24): old duel Bot 3 records "Bot 3 · 强度 N" / "Bot 3 · 入门" -> "Bot 0 · <难度名>".
+  // Only ai_label changes; ai_key, scores, verify etc. untouched. Party records saved as plain "Bot 3" are not matched.
+  // POST { dryRun: true } -> counts + rows; POST { dryRun: false } -> backs up rows to relabel_backup, then updates.
+  // Optional { before: <ms timestamp> } limits to records played before that time.
+  if (sub === "/relabel-bot0" && method === "POST") {
+    const b = await body();
+    const dryRun = b?.dryRun !== false;
+    const before = Number.isFinite(Number(b?.before)) && Number(b?.before) > 0 ? Number(b.before) : null;
+    const TIERS = ["入门", "简单", "中等", "困难", "困难+"];
+    const rows = acc.q(`SELECT user_id, id, played_at, ai_key, ai_label FROM matches
+      WHERE mode = 'vsAI' AND players = 2 AND ai_key LIKE 'bot3-s%' AND (ai_label LIKE 'Bot 3 · 强度 %' OR ai_label = 'Bot 3 · 入门')
+      ${before ? "AND played_at < ?" : ""} ORDER BY played_at`, ...(before ? [before] : []));
+    const plan = [];
+    for (const r of rows) {
+      const n = r.ai_label === "Bot 3 · 入门" ? 0 : Number(String(r.ai_label).slice("Bot 3 · 强度 ".length));
+      if (!Number.isInteger(n) || n < 0 || n > 4) continue;
+      plan.push({ userId: r.user_id, id: r.id, playedAt: r.played_at, aiKey: r.ai_key, from: r.ai_label, to: `Bot 0 · ${TIERS[n]}` });
+    }
+    const byLabel = {};
+    for (const p of plan) byLabel[p.from] = (byLabel[p.from] || 0) + 1;
+    if (!dryRun) {
+      acc.sql.exec(`CREATE TABLE IF NOT EXISTS relabel_backup (batch INTEGER NOT NULL, user_id TEXT NOT NULL, id TEXT NOT NULL,
+        old_label TEXT, new_label TEXT)`);
+      const batch = Date.now();
+      for (const p of plan) {
+        acc.sql.exec(`INSERT INTO relabel_backup (batch, user_id, id, old_label, new_label) VALUES (?, ?, ?, ?, ?)`, batch, p.userId, p.id, p.from, p.to);
+        acc.sql.exec(`UPDATE matches SET ai_label = ? WHERE user_id = ? AND id = ? AND ai_label = ?`, p.to, p.userId, p.id, p.from);
+      }
+      log("matches.relabel-bot0", batch, { count: plan.length, byLabel, before });
+      return json({ ok: true, dryRun, batch, count: plan.length, byLabel, rows: plan });
+    }
+    return json({ ok: true, dryRun, count: plan.length, byLabel, rows: plan });
+  }
+  // Undo a relabel batch from relabel_backup.
+  if (sub === "/relabel-bot0/undo" && method === "POST") {
+    const b = await body();
+    const batch = Number(b?.batch);
+    const rows = acc.q(`SELECT * FROM relabel_backup WHERE batch = ?`, batch);
+    for (const r of rows) acc.sql.exec(`UPDATE matches SET ai_label = ? WHERE user_id = ? AND id = ? AND ai_label = ?`, r.old_label, r.user_id, r.id, r.new_label);
+    log("matches.relabel-bot0.undo", batch, { count: rows.length });
+    return json({ ok: true, restored: rows.length });
+  }
+
   if (sub === "/log" && method === "GET") {
     return json({ log: acc.q(`SELECT * FROM admin_log ORDER BY id DESC LIMIT ?`, limit) });
   }

@@ -97,3 +97,26 @@ test("admin moves: read stored move list (admin only), 404 when none, filter ver
   r = await call(acc, "GET", "/api/admin/matches?verify=moves", null, ADMIN);
   assert.deepEqual(r.data.matches.map((m) => m.id), ["mv-game-01"]); assert.equal(r.data.matches[0].hasMoves, true);
 });
+
+test("relabel-bot0: dry run, apply with backup, undo; party 'Bot 3' and aiKey untouched", async () => {
+  const acc = await make({ ADMIN_TOKEN: ADMIN });
+  await call(acc, "POST", "/api/register", { username: "relab", password: "secret1", confirmPassword: "secret1" });
+  const uid = (await call(acc, "GET", "/api/admin/users?q=relab", null, ADMIN)).data.users[0].id;
+  const mk = (id, aiLabel, aiKey) => call(acc, "POST", "/api/admin/matches", { userId: uid, id, mode: "vsAI", players: 2, boardSize: 6, aiKey, aiLabel, moves: 40, result: "loss" }, ADMIN);
+  await mk("relabel-0001", "Bot 3 · 强度 4", "bot3-s4");
+  await mk("relabel-0002", "Bot 3 · 入门", "bot3-s0");
+  await mk("relabel-0003", "Bot 3", "bot3-s4");
+  await mk("relabel-0004", "Bot 2 · 2档", "bot2-l2");
+  let r = (await call(acc, "POST", "/api/admin/relabel-bot0", { dryRun: true }, ADMIN)).data;
+  assert.equal(r.count, 2);
+  assert.deepEqual(r.rows.map(x => x.to).sort(), ["Bot 0 · 入门", "Bot 0 · 困难+"]);
+  r = (await call(acc, "POST", "/api/admin/relabel-bot0", { dryRun: false }, ADMIN)).data;
+  assert.equal(r.count, 2);
+  const list = (await call(acc, "GET", `/api/admin/matches?userId=${uid}`, null, ADMIN)).data;
+  const labels = Object.fromEntries((list.matches || []).map(m => [m.id, [m.aiLabel, m.aiKey]]));
+  assert.deepEqual(labels["relabel-0001"], ["Bot 0 · 困难+", "bot3-s4"]);
+  assert.deepEqual(labels["relabel-0003"], ["Bot 3", "bot3-s4"]);
+  assert.deepEqual(labels["relabel-0004"], ["Bot 2 · 2档", "bot2-l2"]);
+  assert.equal(((await call(acc, "POST", "/api/admin/relabel-bot0", { dryRun: true }, ADMIN)).data).count, 0);
+  assert.equal(((await call(acc, "POST", "/api/admin/relabel-bot0/undo", { batch: r.batch }, ADMIN)).data).restored, 2);
+});
