@@ -17,7 +17,8 @@ export const similarityEnforced = (env) => String(env?.SIMILARITY_ENFORCE ?? "")
 
 /** Leaderboard filter. Restored games never count; similarity duplicates only when enforcing. */
 export function countedSql(env) {
-  return `(verify IS NULL OR verify IN ('ok', 'approved')) AND COALESCE(restored, 0) = 0`
+  // Leaderboard only counts duel board sizes 6/9/12 (2026-11-24); other sizes are party games. No data deleted.
+  return `(verify IS NULL OR verify IN ('ok', 'approved')) AND COALESCE(restored, 0) = 0 AND board_size IN (6, 9, 12)`
     + (similarityEnforced(env) ? ` AND COALESCE(sim_status, '') <> 'dup'` : "");
 }
 

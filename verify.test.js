@@ -115,14 +115,14 @@ test("end to end: forged uploads are kept but off the leaderboard until an admin
   const acc = await make({ ADMIN_TOKEN: "adm-secret-1" });
   const tok = (await call(acc, "POST", "/api/register", { username: "Sam", password: "secret1", confirmPassword: "secret1" })).data.token;
   const t = Date.now() - 3 * 3600000;
-  const up = (id, i, over = {}) => ({ id, playedAt: t + i * 600000, mode: "vsAI", players: 2, boardSize: 5, aiKey: "bot3-s1", aiLabel: "Bot 3 · 强度 1", moves: 30, myMoves: 15, result: "win", duration: 200, ...over });
+  const up = (id, i, over = {}) => ({ id, playedAt: t + i * 600000, mode: "vsAI", players: 2, boardSize: 6, aiKey: "bot3-s1", aiLabel: "Bot 3 · 强度 1", moves: 30, myMoves: 15, result: "win", duration: 200, ...over });
   // a historical row (from before anti-cheat): verify stays NULL and keeps counting
   await call(acc, "POST", "/api/matches", { matches: [up("hist-0001", 0)] }, tok);
   acc.sql.exec(`UPDATE matches SET verify = NULL, verify_reason = NULL`);
   await call(acc, "POST", "/api/matches", { matches: [up("good-0001", 1), up("good-0002", 2), up("forged-001", 3, { moves: 3, myMoves: 2, duration: 1 })] }, tok);
   const rows = acc.q(`SELECT id, verify FROM matches ORDER BY id`);
   assert.deepEqual(rows.map(r => [r.id, r.verify]), [["forged-001", "flagged"], ["good-0001", "ok"], ["good-0002", "ok"], ["hist-0001", null]]);
-  const lb = async () => (await call(acc, "GET", "/api/leaderboard?period=all&aiKey=bot3-s1&boardSize=5")).data.entries;
+  const lb = async () => (await call(acc, "GET", "/api/leaderboard?period=all&aiKey=bot3-s1&boardSize=6")).data.entries;
   assert.equal((await lb())[0].games, 3);
   const flagged = (await call(acc, "GET", "/api/admin/matches?verify=flagged", null, "adm-secret-1")).data.matches;
   assert.equal(flagged.length, 1); assert.ok(flagged[0].verifyReason);
@@ -158,4 +158,16 @@ test("admin CORS only for Sam's admin site", async () => {
   assert.equal(r.headers.get("access-control-allow-origin"), null);
   r = await call(acc, "GET", "/api/leaderboard?period=all", null, null, "https://evil.example");
   assert.equal(r.headers.get("access-control-allow-origin"), "*");
+});
+
+test("leaderboard only counts 6/9/12 boards; other sizes stay in history", async () => {
+  const acc = await make({});
+  const tok = (await call(acc, "POST", "/api/register", { username: "Size", password: "secret1", confirmPassword: "secret1" })).data.token;
+  const t = Date.now() - 3600000;
+  const up = (id, i, boardSize) => ({ id, playedAt: t + i * 600000, mode: "vsAI", players: 2, boardSize, aiKey: "bot3-s1", aiLabel: "Bot 3 · 强度 1", moves: 30, myMoves: 15, result: "win", duration: 200 });
+  await call(acc, "POST", "/api/matches", { matches: [up("size-0005", 0, 5), up("size-0006", 1, 6), up("size-0008", 2, 8)] }, tok);
+  const d = (await call(acc, "GET", "/api/leaderboard?period=all&aiKey=bot3-s1")).data;
+  assert.deepEqual(d.boardSizes.map(b => b.boardSize), [6]);
+  assert.equal((await call(acc, "GET", "/api/leaderboard?period=all&aiKey=bot3-s1&boardSize=5")).data.entries.length, 0);
+  assert.equal(acc.q(`SELECT COUNT(*) AS n FROM matches`)[0].n, 3);
 });
