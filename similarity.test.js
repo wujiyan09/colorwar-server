@@ -114,3 +114,32 @@ test("enforcement is on by default; only 'false' turns it off", async () => {
   assert.equal(similarityEnforced({ SIMILARITY_ENFORCE: "true" }), true);
   assert.equal(similarityEnforced({ SIMILARITY_ENFORCE: "FALSE" }), false);
 });
+
+test("prefix rule: first max(40, 60%) moves identical -> dup; endings may differ", () => {
+  const mk = (n, tailSeed) => encodeMoves(Array.from({ length: n }, (_, i) => i < 64 ? [i % 2, i % 6, (i * 5) % 6] : [i % 2, (i + tailSeed) % 6, (i * tailSeed) % 6]));
+  const a = { moves: mk(81, 1), board: null }, b = { moves: mk(79, 4), board: null };
+  const c = compareGames(a, b);
+  assert.equal(c.dup, true);
+  assert.match(c.rule, /^前 \d+ 步完全相同$/);
+  const short = encodeMoves(Array.from({ length: 79 }, (_, i) => i < 39 ? [0, i % 6, 0] : [1, i % 6, i % 5]));
+  const short2 = encodeMoves(Array.from({ length: 79 }, (_, i) => i < 39 ? [0, i % 6, 0] : [1, (i + 2) % 6, (i + 3) % 5]));
+  assert.equal(compareGames({ moves: short }, { moves: short2 }).dup, false); // 39 < 48
+});
+
+test("admin rescan-similarity: dry run lists, apply flags later games, undo restores", async () => {
+  const { acc, up, row } = await setup({});
+  const base = randomMoves(70, 7);
+  await up("scan-0001", base);
+  // same 50-move opening, different ending (old rules would not flag)
+  await up("scan-0002", [...base.slice(0, 50), ...randomMoves(25, 99)]);
+  // simulate a game uploaded before the prefix rule existed
+  acc.sql.exec(`UPDATE matches SET sim_status = NULL, sim_reason = NULL`);
+  const H = "adm-secret-1";
+  let r = (await call(acc, "POST", "/api/admin/rescan-similarity", { dryRun: true }, H)).data;
+  assert.equal(r.count, 1); assert.equal(r.rows[0].id, "scan-0002");
+  assert.equal(row("scan-0002").sim_status, null);
+  r = (await call(acc, "POST", "/api/admin/rescan-similarity", { dryRun: false }, H)).data;
+  assert.equal(row("scan-0002").sim_status, "dup"); assert.equal(row("scan-0001").sim_status, null);
+  assert.equal((await call(acc, "POST", "/api/admin/rescan-similarity/undo", { batch: r.batch }, H)).data.restored, 1);
+  assert.equal(row("scan-0002").sim_status, null);
+});

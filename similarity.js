@@ -6,6 +6,8 @@ export const SIMILARITY = {
   minMoves: 30,           // both games need at least this many moves
   tailMoves: 15,          // rule 1: last N moves identical → duplicate
   alignedRatio: 0.9,      // rule 2: move-by-move identical share of the shorter game ≥ this → duplicate
+  prefixMin: 40,          // rule 4 (2026-11-24): first N moves identical, N = max(prefixMin, prefixRatio × shorter)
+  prefixRatio: 0.6,
   maxStoredPerUser: 300,  // keep move lists for at most this many recent games per user
   maxMoves: 4000,
 };
@@ -45,5 +47,9 @@ export function compareGames(a, b) {
   if (x.slice(-t).join("") === y.slice(-t).join("")) return { dup: true, percent: Math.max(percent, Math.round(t / shorter * 100)), rule: `最后 ${t} 步完全相同` };
   if (a.board && b.board && a.board === b.board) return { dup: true, percent, rule: "终局棋盘完全相同" };
   if (same / shorter >= SIMILARITY.alignedRatio) return { dup: true, percent, rule: "逐步对比几乎相同" };
+  const need = Math.max(SIMILARITY.prefixMin, Math.ceil(SIMILARITY.prefixRatio * shorter));
+  let prefix = 0;
+  while (prefix < shorter && x[prefix] === y[prefix]) prefix++;
+  if (prefix >= need && prefix <= shorter) return { dup: true, percent, rule: `前 ${prefix} 步完全相同` };
   return { dup: false, percent };
 }

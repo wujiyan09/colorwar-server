@@ -3,6 +3,7 @@
 // If ADMIN_TOKEN is not set, every /api/admin route answers 404. Never returns passwords.
 // Edits go straight into the same tables the app and leaderboard read, so they show up immediately.
 import { normalizeMatch, validateUsername } from "./accounts.js";
+import { compareGames, SIMILARITY } from "./similarity.js";
 
 const RESULTS = ["win", "loss", "draw", "none"];
 const MODES = ["vsAI", "local", "online"];
@@ -238,6 +239,54 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
       return json({ ok: true, dryRun, batch, count: plan.length, byLabel, rows: plan });
     }
     return json({ ok: true, dryRun, count: plan.length, byLabel, rows: plan });
+  }
+  // ---- one-off similarity rescan (2026-11-24): re-check stored vs-AI wins with the current rules (incl. prefix rule).
+  // Same pairing as upload: same user, ai_key, board size, within the window; the earliest game stays, later ones get 'dup'.
+  // Only games with no sim_status yet are changed (approved / already-dup untouched). POST { dryRun } ; undo via /rescan-similarity/undo { batch }.
+  if (sub === "/rescan-similarity" && method === "POST") {
+    const b = await body();
+    const dryRun = b?.dryRun !== false;
+    const rows = acc.q(`SELECT m.user_id, u.username, m.id, m.played_at, m.ai_key, m.board_size, m.sim_moves, m.sim_board, m.sim_status
+      FROM matches m LEFT JOIN users u ON u.id = m.user_id
+      WHERE m.mode = 'vsAI' AND m.result = 'win' AND m.sim_moves IS NOT NULL ORDER BY m.played_at`);
+    const groups = new Map();
+    for (const r of rows) { const k = `${r.user_id}|${r.ai_key}|${r.board_size}`; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); }
+    const win = SIMILARITY.windowDays * 86400000, plan = [];
+    for (const list of groups.values()) {
+      for (let i = 1; i < list.length; i++) {
+        const g = list[i];
+        if (g.sim_status) continue;
+        for (let j = 0; j < i; j++) {
+          const e = list[j];
+          if (g.played_at - e.played_at > win) continue;
+          const c = compareGames({ moves: g.sim_moves, board: g.sim_board }, { moves: e.sim_moves, board: e.sim_board });
+          if (!c.dup) continue;
+          plan.push({ userId: g.user_id, username: g.username, id: g.id, aiKey: g.ai_key, boardSize: g.board_size, playedAt: g.played_at,
+            reason: `与对局 ${e.id} 相似度 ${c.percent}%（${c.rule}）` });
+          break;
+        }
+      }
+    }
+    if (!dryRun) {
+      acc.sql.exec(`CREATE TABLE IF NOT EXISTS rescan_backup (batch INTEGER NOT NULL, user_id TEXT NOT NULL, id TEXT NOT NULL, old_status TEXT, old_reason TEXT)`);
+      const batch = Date.now();
+      for (const p of plan) {
+        const cur = acc.one(`SELECT sim_status, sim_reason FROM matches WHERE user_id = ? AND id = ?`, p.userId, p.id);
+        if (!cur || cur.sim_status) continue;
+        acc.sql.exec(`INSERT INTO rescan_backup (batch, user_id, id, old_status, old_reason) VALUES (?, ?, ?, ?, ?)`, batch, p.userId, p.id, cur.sim_status, cur.sim_reason);
+        acc.sql.exec(`UPDATE matches SET sim_status = 'dup', sim_reason = ? WHERE user_id = ? AND id = ? AND sim_status IS NULL`, p.reason, p.userId, p.id);
+      }
+      log("matches.rescan-similarity", batch, { count: plan.length });
+      return json({ ok: true, dryRun, batch, count: plan.length, rows: plan });
+    }
+    return json({ ok: true, dryRun, count: plan.length, rows: plan });
+  }
+  if (sub === "/rescan-similarity/undo" && method === "POST") {
+    const b = await body();
+    const rows = acc.q(`SELECT * FROM rescan_backup WHERE batch = ?`, Number(b?.batch));
+    for (const r of rows) acc.sql.exec(`UPDATE matches SET sim_status = ?, sim_reason = ? WHERE user_id = ? AND id = ? AND sim_status = 'dup'`, r.old_status, r.old_reason, r.user_id, r.id);
+    log("matches.rescan-similarity.undo", b?.batch, { count: rows.length });
+    return json({ ok: true, restored: rows.length });
   }
   // Undo a relabel batch from relabel_backup.
   if (sub === "/relabel-bot0/undo" && method === "POST") {
