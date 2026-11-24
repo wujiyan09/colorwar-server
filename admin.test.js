@@ -82,3 +82,18 @@ test("admin CRUD: users, matches, friends, sessions, log; leaderboard reflects e
   const log = (await call(acc, "GET", "/api/admin/log", null, ADMIN)).data.log.map(x => x.action);
   for (const k of ["user.edit", "match.create", "match.edit", "match.delete", "friend.delete", "session.delete", "user.delete"]) assert.ok(log.includes(k), k);
 });
+
+test("admin moves: read stored move list (admin only), 404 when none, filter verify=moves", async () => {
+  const acc = await make({ ADMIN_TOKEN: ADMIN });
+  await call(acc, "POST", "/api/register", { username: "Mo", password: "secret1", confirmPassword: "secret1" });
+  const uid = (await call(acc, "GET", "/api/admin/users?q=mo", null, ADMIN)).data.users[0].id;
+  for (const id of ["mv-game-01", "mv-game-02"])
+    await call(acc, "POST", "/api/admin/matches", { userId: uid, id, mode: "vsAI", players: 2, boardSize: 5, moves: 40, result: "win" }, ADMIN);
+  acc.sql.exec(`UPDATE matches SET sim_moves = ?, sim_board = ? WHERE user_id = ? AND id = ?`, "023112", "1f00", uid, "mv-game-01");
+  let r = await call(acc, "GET", `/api/admin/matches/${uid}/mv-game-01/moves`, null, ADMIN);
+  assert.equal(r.status, 200); assert.equal(r.data.moves, "023112"); assert.equal(r.data.board, "1f00"); assert.equal(r.data.boardSize, 5);
+  assert.equal((await call(acc, "GET", `/api/admin/matches/${uid}/mv-game-02/moves`, null, ADMIN)).status, 404);
+  assert.equal((await call(acc, "GET", `/api/admin/matches/${uid}/mv-game-01/moves`)).status, 401);
+  r = await call(acc, "GET", "/api/admin/matches?verify=moves", null, ADMIN);
+  assert.deepEqual(r.data.matches.map((m) => m.id), ["mv-game-01"]); assert.equal(r.data.matches[0].hasMoves, true);
+});
