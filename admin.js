@@ -49,7 +49,7 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     userId: r.user_id, username: r.username ?? null, id: r.id, playedAt: r.played_at, mode: r.mode, players: r.players,
     boardSize: r.board_size, aiKey: r.ai_key, aiLabel: r.ai_label, moves: r.moves, myMoves: r.my_moves, result: r.result,
     duration: r.duration, verify: r.verify ?? null, verifyReason: r.verify_reason ?? null,
-    restored: !!r.restored, similar: r.sim_status ?? null, similarReason: r.sim_reason ?? null,
+    restored: !!r.restored, similar: r.sim_status ?? null, similarReason: r.sim_reason ?? null, hasMoves: !!r.sim_moves,
     detail: r.detail ? (() => { try { return JSON.parse(r.detail); } catch { return r.detail; } })() : null,
   });
 
@@ -98,6 +98,7 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     if (verify === "historical") where.push("m.verify IS NULL");
     else if (verify === "similar") where.push("m.sim_status = 'dup'");
     else if (verify === "restored") where.push("m.restored = 1");
+    else if (verify === "moves") where.push("m.sim_moves IS NOT NULL");
     else if (verify) { where.push("m.verify = ?"); args.push(verify); }
     if (url.searchParams.get("aiKey")) { where.push("m.ai_key = ?"); args.push(url.searchParams.get("aiKey")); }
     if (url.searchParams.get("from")) { where.push("m.played_at >= ?"); args.push(Number(url.searchParams.get("from")) || 0); }
@@ -122,6 +123,16 @@ export async function handleAdmin(acc, request, url, path, method, { HttpError, 
     acc.sql.exec(`UPDATE matches SET verify = 'approved', verify_reason = '管理员手动添加', uploaded_at = ? WHERE user_id = ? AND id = ?`, Date.now(), u.id, fx.id);
     log("match.create", `${u.id}/${fx.id}`, fx);
     return json({ match: matchOut(acc.one(`SELECT * FROM matches WHERE user_id = ? AND id = ?`, u.id, fx.id)) }, 201);
+  }
+  // read-only: stored move list + final board (only vs-AI wins ≥ 30 moves, kept ~8 days); replayed in the admin page, not here
+  m = sub.match(/^\/matches\/([^/]+)\/([^/]+)\/moves$/);
+  if (m && method === "GET") {
+    const r = acc.one(`SELECT user_id, id, board_size, players, sim_moves, sim_board, detail FROM matches WHERE user_id = ? AND id = ?`,
+      decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+    if (!r) throw new HttpError(404, "对局不存在");
+    if (!r.sim_moves) throw new HttpError(404, "这局没有保存棋步（只存 30 步以上的人机胜局，约 8 天）");
+    return json({ boardSize: r.board_size, players: r.players, moves: r.sim_moves, board: r.sim_board || null,
+      detail: r.detail ? (() => { try { return JSON.parse(r.detail); } catch { return null; } })() : null });
   }
   m = sub.match(/^\/matches\/([^/]+)\/([^/]+)$/);
   if (m && (method === "PATCH" || method === "DELETE")) {
